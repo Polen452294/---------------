@@ -1,7 +1,17 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from booking_bot.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -16,20 +26,6 @@ class Business(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Europe/Moscow")
     locale: Mapped[str] = mapped_column(String(10), nullable=False, default="ru")
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="RUB")
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-
-
-class BotInstallation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    __tablename__ = "bot_installations"
-
-    business_id: Mapped[UUID] = mapped_column(
-        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    telegram_bot_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
-    username: Mapped[str | None] = mapped_column(String(64))
-    token_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
-    webhook_path_secret: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    webhook_header_secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
@@ -88,3 +84,16 @@ class MasterInvite(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=False, index=True
     )
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SpecialistProfile(TimestampMixin, Base):
+    __tablename__ = "specialist_profile"
+    __table_args__ = (CheckConstraint("id = 1", name="single_row"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    business_id: Mapped[UUID] = mapped_column(
+        ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    master_id: Mapped[UUID] = mapped_column(
+        ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, unique=True
+    )

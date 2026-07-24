@@ -1,62 +1,68 @@
+import hmac
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from booking_bot.bot import dispatcher
 from booking_bot.bot.factory import create_telegram_bot
 from booking_bot.config import Settings
-from booking_bot.db.models import BotInstallation
-from booking_bot.services.token_cipher import BotTokenCipher, webhook_secret_matches
-
-
-class BotInstallationNotFoundError(LookupError):
-    pass
+from booking_bot.services.specialist_context import (
+    SpecialistNotConfiguredError,
+    get_specialist_context,
+)
 
 
 class InvalidWebhookSecretError(PermissionError):
     pass
 
 
+class TelegramBotNotConfiguredError(RuntimeError):
+    pass
+
+
 class TelegramWebhookService:
+    """Deliver updates to the only Telegram bot configured for this deployment."""
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        encryption_key = (
-            settings.bot_token_encryption_key.get_secret_value()
-            if settings.bot_token_encryption_key
-            else None
-        )
-        self._cipher = BotTokenCipher(encryption_key)
 
     async def process(
         self,
         *,
-        webhook_path_secret: str,
         webhook_header_secret: str | None,
         payload: dict[str, Any],
         session: AsyncSession,
     ) -> None:
-        installation = await session.scalar(
-            select(BotInstallation).where(
-                BotInstallation.webhook_path_secret == webhook_path_secret,
-                BotInstallation.is_active.is_(True),
-            )
+        expected_secret = (
+            self._settings.telegram_webhook_header_secret.get_secret_value()
+            if self._settings.telegram_webhook_header_secret
+            else None
         )
-        if installation is None:
-            raise BotInstallationNotFoundError
-        if not webhook_secret_matches(
-            webhook_header_secret, installation.webhook_header_secret_hash
+        token = (
+            self._settings.telegram_bot_token.get_secret_value()
+            if self._settings.telegram_bot_token
+            else None
+        )
+        if not expected_secret or not token:
+            raise TelegramBotNotConfiguredError
+        if webhook_header_secret is None or not hmac.compare_digest(
+            webhook_header_secret,
+            expected_secret,
         ):
             raise InvalidWebhookSecretError
 
-        token = self._cipher.decrypt(installation.token_ciphertext)
+        try:
+            context = await get_specialist_context(session)
+        except SpecialistNotConfiguredError as exc:
+            raise TelegramBotNotConfiguredError from exc
+
         bot = create_telegram_bot(token, self._settings)
         try:
             await dispatcher.feed_raw_update(
                 bot,
                 payload,
-                business_id=installation.business_id,
-                bot_installation_id=installation.id,
+                business_id=context.business_id,
+                specialist_master_id=context.master_id,
                 db_session=session,
             )
             await session.commit()

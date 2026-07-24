@@ -45,7 +45,7 @@ STATUS_LABELS = {
     AppointmentStatus.CONFIRMED.value: "подтверждена",
     AppointmentStatus.COMPLETED.value: "выполнена",
     AppointmentStatus.NO_SHOW.value: "клиент не пришёл",
-    AppointmentStatus.CANCELLED_BY_MASTER.value: "отменена мастером",
+    AppointmentStatus.CANCELLED_BY_MASTER.value: "отменена специалистом",
     AppointmentStatus.CANCELLED_BY_CLIENT.value: "отменена клиентом",
 }
 STATUS_ACTIONS = {
@@ -109,7 +109,7 @@ def _format_appointment(item: MasterAppointment) -> str:
 
 
 async def _deny(callback: CallbackQuery) -> None:
-    await callback.answer("Кабинет доступен только привязанному мастеру", show_alert=True)
+    await callback.answer("Кабинет доступен только владельцу бота", show_alert=True)
 
 
 @router.callback_query(F.data == "master:menu")
@@ -127,7 +127,7 @@ async def master_menu(
     await state.clear()
     await _edit(
         callback,
-        f"Кабинет мастера <b>{escape(master.display_name)}</b>:",
+        f"Мой кабинет — <b>{escape(master.display_name)}</b>:",
         reply_markup=master_menu_keyboard(),
     )
     await callback.answer()
@@ -345,7 +345,7 @@ async def master_receive_weekday_hours(
     context = await _master_for_actor(message.from_user, db_session, business_id)
     if context is None:
         await state.clear()
-        await message.answer("Кабинет мастера недоступен.")
+        await message.answer("Кабинет специалиста недоступен.")
         return
     _user, master = context
     data = await state.get_data()
@@ -479,7 +479,7 @@ async def master_receive_block(
     context = await _master_for_actor(message.from_user, db_session, business_id)
     if context is None:
         await state.clear()
-        await message.answer("Кабинет мастера недоступен.")
+        await message.answer("Кабинет специалиста недоступен.")
         return
     _user, master = context
     match = DATED_RANGE_PATTERN.fullmatch((message.text or "").strip())
@@ -602,7 +602,7 @@ async def master_receive_extra_day(
     context = await _master_for_actor(message.from_user, db_session, business_id)
     if context is None:
         await state.clear()
-        await message.answer("Кабинет мастера недоступен.")
+        await message.answer("Кабинет специалиста недоступен.")
         return
     _user, master = context
     match = DATED_RANGE_PATTERN.fullmatch((message.text or "").strip())
@@ -649,7 +649,7 @@ async def master_notifications(
     )
     await _edit(
         callback,
-        "<b>Уведомления мастера</b>\n\nЗдесь можно отключить сообщения о новых записях.",
+        "<b>Уведомления специалиста</b>\n\nЗдесь можно отключить сообщения о новых записях.",
         reply_markup=master_notifications_keyboard(enabled),
     )
     await callback.answer()
@@ -673,7 +673,7 @@ async def master_toggle_notifications(
     )
     await _edit(
         callback,
-        "<b>Уведомления мастера</b>\n\nЗдесь можно отключить сообщения о новых записях.",
+        "<b>Уведомления специалиста</b>\n\nЗдесь можно отключить сообщения о новых записях.",
         reply_markup=master_notifications_keyboard(enabled),
     )
     await callback.answer("Уведомления включены" if enabled else "Уведомления выключены")

@@ -21,6 +21,7 @@ class Location(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 class Service(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "services"
     __table_args__ = (
+        UniqueConstraint("business_id", "config_key"),
         CheckConstraint("duration_minutes > 0", name="duration_positive"),
         CheckConstraint("buffer_before_minutes >= 0", name="buffer_before_nonnegative"),
         CheckConstraint("buffer_after_minutes >= 0", name="buffer_after_nonnegative"),
@@ -30,6 +31,7 @@ class Service(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     business_id: Mapped[UUID] = mapped_column(
         ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    config_key: Mapped[str | None] = mapped_column(String(80))
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)

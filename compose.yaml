@@ -1,18 +1,20 @@
-name: telegram-booking-platform
+name: ${COMPOSE_PROJECT_NAME:-telegram-specialist-booking-bot}
 
 services:
   api:
     build: .
-    image: telegram-booking-platform-app:latest
+    image: telegram-specialist-booking-bot-app:latest
     env_file:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://booking:booking@postgres:5432/booking}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgresql+asyncpg://booking:booking@postgres:5432/booking}
+      REDIS_URL: ${DOCKER_REDIS_URL:-redis://redis:6379/0}
       TELEGRAM_PROXY_URL: ${DOCKER_TELEGRAM_PROXY_URL:-}
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./specialist.toml:/app/specialist.toml:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -20,24 +22,40 @@ services:
         condition: service_healthy
     command: >-
       sh -c "alembic upgrade head &&
+      booking-admin configure &&
       fastapi run src/booking_bot/main.py --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/ready')",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   worker:
     build: .
-    image: telegram-booking-platform-app:latest
+    image: telegram-specialist-booking-bot-app:latest
     env_file:
       - path: .env
         required: false
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://booking:booking@postgres:5432/booking}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${DOCKER_DATABASE_URL:-postgresql+asyncpg://booking:booking@postgres:5432/booking}
+      REDIS_URL: ${DOCKER_REDIS_URL:-redis://redis:6379/0}
       TELEGRAM_PROXY_URL: ${DOCKER_TELEGRAM_PROXY_URL:-}
+    volumes:
+      - ./specialist.toml:/app/specialist.toml:ro
     depends_on:
+      api:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: booking-admin run-worker --business ${WORKER_BUSINESS_SLUG:-demo}
+    command: booking-admin run-worker
     restart: unless-stopped
 
   postgres:
@@ -47,7 +65,7 @@ services:
       POSTGRES_USER: booking
       POSTGRES_PASSWORD: booking
     ports:
-      - "55432:5432"
+      - "${POSTGRES_PORT:-55432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -59,7 +77,7 @@ services:
   redis:
     image: redis:7.4-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

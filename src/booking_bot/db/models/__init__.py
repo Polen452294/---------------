@@ -6,11 +6,11 @@ from booking_bot.db.models.appointments import (
     TimeBlock,
 )
 from booking_bot.db.models.business import (
-    BotInstallation,
     Business,
     BusinessMember,
     Master,
     MasterInvite,
+    SpecialistProfile,
     TelegramUser,
 )
 from booking_bot.db.models.catalog import Location, MasterService, Service
@@ -21,7 +21,6 @@ __all__ = [
     "Appointment",
     "AppointmentHistory",
     "AuditLog",
-    "BotInstallation",
     "Business",
     "BusinessMember",
     "CalendarEntry",
@@ -34,6 +33,7 @@ __all__ = [
     "ScheduleException",
     "Service",
     "SlotHold",
+    "SpecialistProfile",
     "TelegramUser",
     "TimeBlock",
     "WorkingRule",

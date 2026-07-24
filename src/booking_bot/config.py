@@ -13,7 +13,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    app_name: str = "Telegram Booking Platform"
+    app_name: str = "Telegram Specialist Booking Bot"
     app_env: Literal["development", "test", "production"] = "development"
     log_level: str = "INFO"
     database_url: str = "postgresql+asyncpg://booking:booking@localhost:55432/booking"
@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_proxy_url: SecretStr | None = None
     telegram_webhook_header_secret: SecretStr | None = None
-    bot_token_encryption_key: SecretStr | None = None
+    specialist_config_path: str = "specialist.toml"
     booking_horizon_days: int = 60
     booking_min_lead_hours: int = 3
     slot_hold_minutes: int = 10

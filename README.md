@@ -1,155 +1,201 @@
-# Telegram Booking Platform
+# Шаблон Telegram-бота для записи к специалисту
 
-Универсальная мультитенантная платформа для записи клиентов к мастерам через
-отдельные брендированные Telegram-боты.
+Одна копия проекта обслуживает одного специалиста и одного Telegram-бота.
+Например, бот тату-мастера Анны имеет собственные:
 
-## Что уже реализовано
+- аккаунт и токен, созданные через BotFather;
+- файл `specialist.toml` с именем, текстами, услугами, адресом и графиком;
+- базу PostgreSQL, Redis и процессы API/уведомлений;
+- клиентов, записи и расписание.
 
-- FastAPI-приложение с liveness/readiness endpoints;
-- защищенный Telegram webhook для нескольких ботов;
-- шифрование токенов ботов с Fernet;
+Проект не является общим каталогом мастеров. Клиент выбирает услугу, дату и
+время, но не мастера. Для продажи бота другому специалисту создается отдельная
+копия развертывания с другим токеном и настройками.
+
+## Реализованные функции
+
 - клиентское меню `/start`, «Записаться» и «Мои записи»;
-- модели бизнесов, пользователей, мастеров, услуг и расписания;
-- единый календарь занятости для записей, блокировок и временных удержаний;
-- PostgreSQL-защита от пересечения активных интервалов мастера;
-- модели напоминаний, настроек уведомлений и аудита;
-- расчет свободных окон с учетом графика, исключений, длительности и буферов услуги;
-- пошаговая запись: услуга → мастер → дата → время → телефон → подтверждение;
-- десятиминутное удержание выбранного окна и безопасное превращение его в запись;
-- подготовка заданий напоминаний за 7 дней, за 3 дня и утром в день записи;
-- кабинет мастера с расписанием на сегодня, завтра и неделю;
-- одноразовые ссылки для безопасной привязки Telegram-профиля мастера;
-- подтверждение, завершение, отмена записи и отметка неявки;
+- сценарий записи: услуга → дата → время → телефон → подтверждение;
+- расчет окон по рабочим часам, длительности и буферам услуги;
+- временное удержание выбранного окна и защита от двойной записи;
+- отдельное расписание специалиста на сегодня, завтра и неделю;
+- подтверждение, завершение и отмена записей, отметка неявки;
 - настройка рабочих часов, выходных, дополнительных дней и блокировок;
-- отдельный notification worker с повторными попытками и защитой от дублей;
-- демонстрационные данные и CLI-команда безопасного подключения отдельного Telegram-бота.
+- уведомление специалиста о новой записи, которое можно отключить;
+- напоминания клиенту за 7 дней, за 3 дня и утром в день записи;
+- повторные попытки отправки уведомлений без дублей;
+- работа через polling при разработке и через защищенный webhook в production.
 
-## Быстрый запуск через Docker
+## Настройка новой копии
 
-1. Создайте файл окружения:
+### 1. Создайте отдельного бота
 
-   ```powershell
-   Copy-Item .env.example .env
-   ```
+В BotFather создайте нового бота специально для этого специалиста. Запишите
+выданный токен в `.env`:
 
-2. Сгенерируйте ключ шифрования и поместите его в
-   `BOT_TOKEN_ENCRYPTION_KEY`:
+```powershell
+Copy-Item .env.example .env
+```
 
-   ```powershell
-   .\.venv\Scripts\python.exe -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-   ```
+```dotenv
+TELEGRAM_BOT_TOKEN=токен_из_BotFather
+```
 
-3. Запустите сервисы:
+Также задайте уникальный `COMPOSE_PROJECT_NAME`, например
+`anna-tattoo-bot`. Если несколько копий запускаются на одном сервере, назначьте
+им разные `API_PORT`, `POSTGRES_PORT` и `REDIS_PORT`.
 
-   ```powershell
-   docker compose up --build
-   ```
+Никогда не добавляйте `.env` и реальные токены в Git.
 
-4. В отдельном терминале создайте демонстрационный бизнес:
+### 2. Заполните `specialist.toml`
 
-   ```powershell
-   docker compose exec api booking-admin seed-demo
-   ```
+В одном файле настраиваются:
 
-5. Проверьте API:
+- `profile` — бренд, имя, роль, часовой пояс и валюта;
+- `location` — название места и адрес;
+- `texts` — индивидуальные приветствие, помощь и сообщения записи;
+- `buttons` — подписи основных клиентских кнопок;
+- `services` — услуги, цены, длительность и буферы;
+- `schedule` — первоначальный недельный график.
 
-   - документация: `http://localhost:8000/docs`;
-   - liveness: `http://localhost:8000/api/v1/health/live`;
-   - readiness: `http://localhost:8000/api/v1/health/ready`.
+У услуги должен быть постоянный уникальный `key`. После изменения файла
+примените настройки повторно:
 
-## Локальная разработка
+```powershell
+.\.venv\Scripts\booking-admin.exe configure
+```
+
+Команду можно запускать многократно. Она обновит профиль и услуги, а удаленные
+из файла услуги отключит. При этом клиентские записи не удаляются.
+
+Тексты и подписи кнопок читаются непосредственно из файла, поэтому для них
+достаточно сохранить `specialist.toml`. Команда `configure` нужна для изменений
+профиля, адреса, услуг и первоначального графика.
+
+Рабочие часы из TOML используются только при первом запуске, чтобы последующие
+настройки владельца в боте не сбрасывались при перезапуске. Для намеренного
+возврата к графику из файла выполните:
+
+```powershell
+.\.venv\Scripts\booking-admin.exe configure --reset-schedule
+```
+
+### 3. Подготовьте окружение
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-Copy-Item .env.example .env
+docker compose up -d postgres redis
 .\.venv\Scripts\alembic.exe upgrade head
-.\.venv\Scripts\fastapi.exe dev src\booking_bot\main.py
+.\.venv\Scripts\booking-admin.exe configure
 ```
 
-Проверки:
+### 4. Привяжите Telegram-профиль специалиста
 
 ```powershell
-.\.venv\Scripts\ruff.exe check .
-.\.venv\Scripts\pytest.exe
-# При запущенном PostgreSQL:
-.\.venv\Scripts\pytest.exe -m integration
+.\.venv\Scripts\booking-admin.exe create-master-invite
 ```
 
-## Локальный запуск Telegram-бота
+Откройте выданную одноразовую ссылку с Telegram-аккаунта владельца. После этого
+у него появится кнопка «Мой кабинет».
 
-Для проверки бота без публичного HTTPS-домена добавьте токен BotFather в `.env`:
+## Локальный запуск
 
-```dotenv
-TELEGRAM_BOT_TOKEN=...
+Polling не требует публичного домена:
+
+```powershell
+.\.venv\Scripts\booking-admin.exe run-polling
 ```
 
-Если Telegram API доступен только через локальный прокси, добавьте:
+Во втором терминале запустите доставку уведомлений:
+
+```powershell
+.\.venv\Scripts\booking-admin.exe run-worker
+```
+
+Если Telegram доступен только через локальный прокси:
 
 ```dotenv
 TELEGRAM_PROXY_URL=http://127.0.0.1:1081
 ```
 
-После запуска PostgreSQL и Redis выполните:
+## Запуск через Docker
+
+После заполнения `.env` и `specialist.toml`:
 
 ```powershell
-.\.venv\Scripts\booking-admin.exe seed-demo
-.\.venv\Scripts\booking-admin.exe run-polling --business demo
-# В отдельном терминале:
-.\.venv\Scripts\booking-admin.exe run-worker --business demo
+docker compose up --build -d
 ```
 
-Команда проверит токен, отключит webhook для этого бота и начнет получать обновления
-через long polling. Остановить процесс можно сочетанием `Ctrl+C`.
+Контейнер API сам применит миграции и настройки специалиста. Worker начнет
+работу после успешной проверки API.
 
-Для привязки Telegram-профиля мастера создайте одноразовую ссылку:
+- документация в development: `http://localhost:8000/docs`;
+- liveness: `http://localhost:8000/api/v1/health/live`;
+- readiness: `http://localhost:8000/api/v1/health/ready`.
+
+## Production webhook
+
+Укажите публичный HTTPS-адрес и случайный секрет в `.env`:
+
+```dotenv
+TELEGRAM_WEBHOOK_BASE_URL=https://booking.example.com
+TELEGRAM_WEBHOOK_HEADER_SECRET=длинная_случайная_строка
+```
+
+После запуска приложения установите webhook:
 
 ```powershell
-.\.venv\Scripts\booking-admin.exe create-master-invite --business demo --master "Анна"
+.\.venv\Scripts\booking-admin.exe set-webhook
 ```
 
-После перехода по ссылке в главном меню появится «Кабинет мастера».
+У этой копии один фиксированный endpoint:
+`/api/v1/webhooks/telegram`. Токен берется только из `TELEGRAM_BOT_TOKEN`.
 
 ## Основные переменные окружения
 
 | Переменная | Назначение |
 | --- | --- |
 | `APP_ENV` | `development`, `test` или `production` |
-| `DATABASE_URL` | Асинхронная строка подключения SQLAlchemy |
-| `REDIS_URL` | Redis для очередей и временного состояния |
-| `TELEGRAM_WEBHOOK_BASE_URL` | Публичный HTTPS-адрес приложения |
-| `TELEGRAM_BOT_TOKEN` | Токен BotFather для локального запуска и регистрации бота |
-| `TELEGRAM_PROXY_URL` | Необязательный HTTP/SOCKS-прокси для соединения с Telegram API |
-| `BOT_TOKEN_ENCRYPTION_KEY` | Ключ шифрования токенов Telegram-ботов |
-| `BOOKING_HORIZON_DAYS` | Горизонт доступных для записи дат, по умолчанию 60 дней |
-| `BOOKING_MIN_LEAD_HOURS` | Минимальное время от текущего момента до записи, по умолчанию 3 часа |
-| `SLOT_HOLD_MINUTES` | Срок временного удержания выбранного окна, по умолчанию 10 минут |
-| `CANCELLATION_CUTOFF_HOURS` | Будущее ограничение самостоятельной отмены, по умолчанию 24 часа |
-| `BOOKING_DATES_SHOWN` | Число дат, показываемых на одном шаге выбора, по умолчанию 14 |
-| `NOTIFICATION_POLL_INTERVAL_SECONDS` | Интервал проверки очереди уведомлений |
-| `NOTIFICATION_BATCH_SIZE` | Максимальное число заданий, забираемых worker за один проход |
-| `NOTIFICATION_MAX_ATTEMPTS` | Максимальное число попыток отправки уведомления |
+| `COMPOSE_PROJECT_NAME` | Уникальное имя Docker-развертывания специалиста |
+| `API_PORT` | Внешний порт API этой копии |
+| `POSTGRES_PORT` | Внешний порт PostgreSQL для локального доступа |
+| `REDIS_PORT` | Внешний порт Redis для локального доступа |
+| `DATABASE_URL` | Подключение к отдельной PostgreSQL этой копии |
+| `REDIS_URL` | Подключение к отдельному Redis этой копии |
+| `DOCKER_DATABASE_URL` | Подключение API/worker к PostgreSQL внутри Docker |
+| `DOCKER_REDIS_URL` | Подключение API/worker к Redis внутри Docker |
+| `SPECIALIST_CONFIG_PATH` | Путь к `specialist.toml` |
+| `TELEGRAM_BOT_TOKEN` | Единственный токен BotFather этой копии |
+| `TELEGRAM_PROXY_URL` | Необязательный HTTP/SOCKS-прокси |
+| `TELEGRAM_WEBHOOK_BASE_URL` | Публичный HTTPS-адрес |
+| `TELEGRAM_WEBHOOK_HEADER_SECRET` | Секрет проверки запросов Telegram |
+| `BOOKING_HORIZON_DAYS` | Горизонт записи, по умолчанию 60 дней |
+| `BOOKING_MIN_LEAD_HOURS` | Минимальное время до визита, по умолчанию 3 часа |
+| `SLOT_HOLD_MINUTES` | Срок удержания окна, по умолчанию 10 минут |
+| `BOOKING_DATES_SHOWN` | Количество показываемых дат, по умолчанию 14 |
+| `NOTIFICATION_POLL_INTERVAL_SECONDS` | Частота проверки очереди уведомлений |
+| `NOTIFICATION_BATCH_SIZE` | Размер пачки уведомлений |
+| `NOTIFICATION_MAX_ATTEMPTS` | Максимум попыток отправки |
 
-Реальные токены ботов и файл `.env` не должны попадать в Git.
-
-## Следующий этап разработки
-
-1. Отмена и перенос записи клиентом с ограничением по времени до визита.
-2. Подтверждение переноса мастером и автоматическое обновление напоминаний.
-3. Онбординг бизнеса и редактирование услуг, мастеров и адресов в боте.
-4. Автоматическая установка Telegram webhook после настройки публичного HTTPS-адреса.
-5. Подготовка production-развертывания, резервного копирования и мониторинга.
-
-## Подключение Telegram-бота
-
-После создания бота через BotFather укажите токен только в переменной окружения,
-не передавайте его аргументом командной строки:
+## Проверки
 
 ```powershell
-$env:TELEGRAM_BOT_TOKEN="..."
-$env:TELEGRAM_WEBHOOK_HEADER_SECRET="..."
-booking-admin register-bot --business demo --bot-id 123456789 --username my_booking_bot
+.\.venv\Scripts\ruff.exe check .
+.\.venv\Scripts\pytest.exe
+.\.venv\Scripts\pytest.exe -m integration
 ```
 
-Команда зашифрует токен в базе и выведет уникальный URL webhook. Установка
-webhook в Telegram будет добавлена после настройки публичного HTTPS-адреса.
+Интеграционные тесты требуют запущенного PostgreSQL.
+
+## Как выпускать бота для следующего специалиста
+
+1. Создать новый аккаунт бота в BotFather.
+2. Развернуть новую копию приложения и отдельные хранилища.
+3. Заполнить новый `.env` и `specialist.toml`.
+4. Выполнить миграции и `booking-admin configure`.
+5. Передать владельцу одноразовую ссылку из `create-master-invite`.
+6. Проверить тестовую запись и уведомления.
+
+Обновления исходного шаблона можно переносить во все копии, не объединяя их
+данные и Telegram-аккаунты.

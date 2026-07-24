@@ -16,6 +16,7 @@ from booking_bot.services.master_access import (
     redeem_master_invite,
 )
 from booking_bot.services.users import get_or_create_telegram_user
+from booking_bot.specialist_config import get_specialist_template
 
 router = Router(name="common")
 
@@ -61,12 +62,12 @@ async def start_handler(
             return
         except MasterAlreadyLinkedError:
             await message.answer(
-                "Этот профиль мастера уже привязан к другому пользователю.",
+                "Этот профиль специалиста уже привязан к другому пользователю.",
                 reply_markup=main_menu_keyboard(),
             )
             return
         await message.answer(
-            f"Профиль мастера <b>{master.display_name}</b> успешно привязан.",
+            f"Профиль специалиста <b>{master.display_name}</b> успешно привязан.",
             reply_markup=master_menu_keyboard(),
         )
         return
@@ -77,7 +78,10 @@ async def start_handler(
         user_id=user.id,
     )
     await message.answer(
-        "Здравствуйте! Здесь можно выбрать услугу, мастера и свободное время.",
+        get_specialist_template().text(
+            "welcome",
+            "Здравствуйте! Здесь можно выбрать услугу, дату и свободное время.",
+        ),
         reply_markup=main_menu_keyboard(master_access=master is not None),
     )
 
@@ -85,7 +89,10 @@ async def start_handler(
 @router.message(Command("help"))
 async def help_handler(message: Message) -> None:
     await message.answer(
-        "Используйте /start, чтобы открыть меню.\n"
-        "Выбранное время удерживается 10 минут до подтверждения.",
+        get_specialist_template().text(
+            "help",
+            "Используйте /start, чтобы открыть меню. "
+            "Выбранное время удерживается 10 минут до подтверждения.",
+        ),
         reply_markup=main_menu_keyboard(),
     )

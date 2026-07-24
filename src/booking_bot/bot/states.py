@@ -3,7 +3,6 @@ from aiogram.fsm.state import State, StatesGroup
 
 class BookingStates(StatesGroup):
     selecting_service = State()
-    selecting_master = State()
     selecting_date = State()
     selecting_slot = State()
     waiting_phone = State()

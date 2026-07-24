@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md specialist.toml ./
 COPY src ./src
 COPY alembic.ini ./
 
@@ -16,4 +16,3 @@ RUN python -m pip install --upgrade pip \
 EXPOSE 8000
 
 CMD ["fastapi", "run", "src/booking_bot/main.py", "--host", "0.0.0.0", "--port", "8000"]
-

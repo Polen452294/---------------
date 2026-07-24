@@ -23,6 +23,7 @@ from booking_bot.db.models import (
 )
 from booking_bot.db.session import async_session_factory
 from booking_bot.domain.enums import NotificationJobState
+from booking_bot.specialist_config import get_specialist_template
 
 
 class NotificationDeliveryError(RuntimeError):
@@ -241,22 +242,33 @@ class NotificationDeliveryService:
             )
         elif job.kind.startswith("client_reminder_"):
             text = (
-                "⏰ <b>Напоминание о записи</b>\n\n"
+                get_specialist_template().text(
+                    "reminder_title",
+                    "⏰ <b>Напоминание о записи</b>",
+                )
+                + "\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
-                f"Мастер: <b>{escape(master.display_name)}</b>\n"
                 f"Дата и время: <b>{local_start:%d.%m.%Y %H:%M}</b>"
                 f"{location_text}"
             )
         elif job.kind == "client_appointment_cancelled":
             text = (
-                "Запись отменена мастером.\n\n"
+                get_specialist_template().text(
+                    "appointment_cancelled",
+                    "Запись отменена специалистом.",
+                )
+                + "\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
                 f"Дата и время: <b>{local_start:%d.%m.%Y %H:%M}</b>\n\n"
                 "Для выбора нового времени откройте /start."
             )
         elif job.kind == "client_appointment_confirmed":
             text = (
-                "✅ <b>Мастер подтвердил запись</b>\n\n"
+                get_specialist_template().text(
+                    "appointment_confirmed",
+                    "✅ <b>Запись подтверждена</b>",
+                )
+                + "\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
                 f"Дата и время: <b>{local_start:%d.%m.%Y %H:%M}</b>"
                 f"{location_text}"

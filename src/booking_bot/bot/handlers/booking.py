@@ -14,7 +14,6 @@ from booking_bot.bot.keyboards import (
     confirmation_keyboard,
     dates_keyboard,
     main_menu_keyboard,
-    masters_keyboard,
     phone_keyboard,
     services_keyboard,
     slots_keyboard,
@@ -32,12 +31,17 @@ from booking_bot.services.bookings import (
     SlotUnavailableError,
 )
 from booking_bot.services.users import get_or_create_telegram_user, set_user_phone
+from booking_bot.specialist_config import get_specialist_template
 
 router = Router(name="booking")
 
 
 def _settings() -> Settings:
     return get_settings()
+
+
+def _template():
+    return get_specialist_template()
 
 
 def _message_from_callback(callback: CallbackQuery) -> Message | None:
@@ -55,7 +59,6 @@ def _format_hold(summary: HoldSummary) -> str:
     return (
         "Проверьте запись:\n\n"
         f"Услуга: <b>{escape(summary.service_name)}</b>\n"
-        f"Мастер: <b>{escape(summary.master_name)}</b>\n"
         f"Дата: <b>{summary.local_start:%d.%m.%Y}</b>\n"
         f"Время: <b>{summary.local_start:%H:%M}-{summary.local_end:%H:%M}</b>"
         f"{location}\n\n"
@@ -98,7 +101,7 @@ async def _show_dates(
     master = await session.get(Master, master_id)
     business = await session.get(Business, business_id)
     if master is None or business is None:
-        await callback.answer("Мастер больше недоступен", show_alert=True)
+        await callback.answer("Запись временно недоступна", show_alert=True)
         return
     timezone = ZoneInfo(master.timezone or business.timezone)
     today = datetime.now(UTC).astimezone(timezone).date()
@@ -138,8 +141,11 @@ async def home_callback(
 async def help_callback(callback: CallbackQuery) -> None:
     await _edit_or_answer(
         callback,
-        "Нажмите «Записаться», выберите услугу, мастера, дату и свободное время.\n"
-        "До подтверждения выбранный слот удерживается 10 минут.",
+        _template().text(
+            "help",
+            "Выберите услугу, дату и свободное время. "
+            "До подтверждения выбранный слот удерживается 10 минут.",
+        ),
         reply_markup=main_menu_keyboard(),
     )
     await callback.answer()
@@ -171,7 +177,7 @@ async def booking_start(
     await state.set_state(BookingStates.selecting_service)
     await _edit_or_answer(
         callback,
-        "Выберите услугу:",
+        _template().text("booking_intro", "Выберите услугу:"),
         reply_markup=services_keyboard(services),
     )
     await callback.answer()
@@ -183,6 +189,7 @@ async def select_service(
     state: FSMContext,
     db_session: AsyncSession,
     business_id: UUID,
+    specialist_master_id: UUID,
 ) -> None:
     try:
         service_id = UUID(callback.data.split(":", 1)[1])
@@ -190,99 +197,27 @@ async def select_service(
         await callback.answer("Некорректная услуга", show_alert=True)
         return
 
-    masters = list(
-        (
-            await db_session.scalars(
-                select(Master)
-                .join(MasterService, MasterService.master_id == Master.id)
-                .where(
-                    Master.business_id == business_id,
-                    Master.is_active.is_(True),
-                    MasterService.business_id == business_id,
-                    MasterService.service_id == service_id,
-                    MasterService.is_active.is_(True),
-                )
-                .order_by(Master.display_name)
-            )
-        ).all()
-    )
-    if not masters:
-        await callback.answer("Для услуги нет доступных мастеров", show_alert=True)
-        return
-    await state.update_data(service_id=str(service_id))
-    await state.set_state(BookingStates.selecting_master)
-    await _edit_or_answer(
-        callback,
-        "Выберите мастера:",
-        reply_markup=masters_keyboard(masters),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "booking:back:masters")
-async def back_to_masters(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db_session: AsyncSession,
-    business_id: UUID,
-) -> None:
-    data = await state.get_data()
-    if "service_id" not in data:
-        await booking_start(callback, state, db_session, business_id)
-        return
-    service_id = UUID(data["service_id"])
-    masters = list(
-        (
-            await db_session.scalars(
-                select(Master)
-                .join(MasterService, MasterService.master_id == Master.id)
-                .where(
-                    Master.business_id == business_id,
-                    MasterService.service_id == service_id,
-                    Master.is_active.is_(True),
-                    MasterService.is_active.is_(True),
-                )
-                .order_by(Master.display_name)
-            )
-        ).all()
-    )
-    await state.set_state(BookingStates.selecting_master)
-    await _edit_or_answer(
-        callback,
-        "Выберите мастера:",
-        reply_markup=masters_keyboard(masters),
-    )
-    await callback.answer()
-
-
-@router.callback_query(BookingStates.selecting_master, F.data.startswith("master:"))
-async def select_master(
-    callback: CallbackQuery,
-    state: FSMContext,
-    db_session: AsyncSession,
-    business_id: UUID,
-) -> None:
-    try:
-        master_id = UUID(callback.data.split(":", 1)[1])
-    except (AttributeError, ValueError):
-        await callback.answer("Некорректный мастер", show_alert=True)
-        return
-    data = await state.get_data()
-    if "service_id" not in data:
-        await callback.answer("Сначала выберите услугу", show_alert=True)
-        return
     available = await db_session.scalar(
-        select(MasterService.id).where(
+        select(MasterService.id)
+        .join(Service, Service.id == MasterService.service_id)
+        .join(Master, Master.id == MasterService.master_id)
+        .where(
+            Service.id == service_id,
+            Service.business_id == business_id,
+            Service.is_active.is_(True),
             MasterService.business_id == business_id,
-            MasterService.master_id == master_id,
-            MasterService.service_id == UUID(data["service_id"]),
+            MasterService.master_id == specialist_master_id,
             MasterService.is_active.is_(True),
+            Master.is_active.is_(True),
         )
     )
     if available is None:
-        await callback.answer("Мастер не оказывает эту услугу", show_alert=True)
+        await callback.answer("Услуга временно недоступна", show_alert=True)
         return
-    await state.update_data(master_id=str(master_id))
+    await state.update_data(
+        service_id=str(service_id),
+        master_id=str(specialist_master_id),
+    )
     await _show_dates(callback, state, db_session, business_id)
 
 
@@ -327,7 +262,7 @@ async def select_date(
     master = await db_session.get(Master, master_id)
     business = await db_session.get(Business, business_id)
     if master is None or business is None:
-        await callback.answer("Мастер недоступен", show_alert=True)
+        await callback.answer("Запись временно недоступна", show_alert=True)
         return
     timezone = ZoneInfo(master.timezone or business.timezone)
     await state.update_data(local_date=local_date.isoformat())
@@ -404,7 +339,7 @@ async def select_slot(
         if message is not None:
             await message.edit_text("Время удерживается 10 минут.")
             await message.answer(
-                "Отправьте номер телефона для связи с мастером:",
+                "Отправьте номер телефона для связи:",
                 reply_markup=phone_keyboard(),
             )
     await callback.answer()
@@ -472,7 +407,7 @@ async def confirm_booking(
         message = _message_from_callback(callback)
         if message is not None:
             await message.answer(
-                "Отправьте номер телефона для связи с мастером:",
+                "Отправьте номер телефона для связи:",
                 reply_markup=phone_keyboard(),
             )
         return
@@ -493,15 +428,18 @@ async def confirm_booking(
 
     await state.clear()
     status_text = (
-        "Ожидает подтверждения мастером" if summary.status == "pending_approval" else "Подтверждена"
+        "Ожидает подтверждения" if summary.status == "pending_approval" else "Подтверждена"
     )
     location = f"\nАдрес: <b>{escape(summary.location_name)}</b>" if summary.location_name else ""
     await _edit_or_answer(
         callback,
-        "Запись создана!\n\n"
+        _template().text(
+            "booking_success",
+            "Запись создана!",
+        )
+        + "\n\n"
         f"Статус: <b>{status_text}</b>\n"
         f"Услуга: <b>{escape(summary.service_name)}</b>\n"
-        f"Мастер: <b>{escape(summary.master_name)}</b>\n"
         f"Дата и время: <b>{summary.local_start:%d.%m.%Y %H:%M}</b>"
         f"{location}",
         reply_markup=main_menu_keyboard(),
@@ -546,15 +484,16 @@ async def my_bookings(
     )
     await state.clear()
     if not appointments:
-        text = "У вас пока нет предстоящих записей."
+        text = _template().text(
+            "no_upcoming_bookings",
+            "У вас пока нет предстоящих записей.",
+        )
     else:
         parts = ["Ваши предстоящие записи:"]
         for item in appointments:
             location = f", {escape(item.location_name)}" if item.location_name else ""
             parts.append(
-                "\n"
-                f"<b>{item.local_start:%d.%m.%Y %H:%M}</b>\n"
-                f"{escape(item.service_name)} - {escape(item.master_name)}{location}"
+                f"\n<b>{item.local_start:%d.%m.%Y %H:%M}</b>\n{escape(item.service_name)}{location}"
             )
         text = "\n".join(parts)
     await _edit_or_answer(callback, text, reply_markup=main_menu_keyboard())

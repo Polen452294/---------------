@@ -8,7 +8,7 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from booking_bot.db.models import Master, Service
+from booking_bot.db.models import Service
 from booking_bot.domain.enums import AppointmentStatus
 from booking_bot.services.availability import BookableSlot
 from booking_bot.services.master_schedule import (
@@ -16,18 +16,44 @@ from booking_bot.services.master_schedule import (
     MasterTimeBlock,
     WeeklyWorkingInterval,
 )
+from booking_bot.specialist_config import get_specialist_template
 
 WEEKDAYS_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 
 def main_menu_keyboard(*, master_access: bool = False) -> InlineKeyboardMarkup:
+    template = get_specialist_template()
     rows = [
-        [InlineKeyboardButton(text="Записаться", callback_data="booking:start")],
-        [InlineKeyboardButton(text="Мои записи", callback_data="booking:mine")],
+        [
+            InlineKeyboardButton(
+                text=template.button("book", "Записаться"),
+                callback_data="booking:start",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=template.button("my_bookings", "Мои записи"),
+                callback_data="booking:mine",
+            )
+        ],
     ]
     if master_access:
-        rows.append([InlineKeyboardButton(text="Кабинет мастера", callback_data="master:menu")])
-    rows.append([InlineKeyboardButton(text="Помощь", callback_data="help")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=template.button("specialist_cabinet", "Мой кабинет"),
+                    callback_data="master:menu",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=template.button("help", "Помощь"),
+                callback_data="help",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -40,20 +66,10 @@ def services_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
             else ""
         )
         builder.button(text=f"{service.name}{price}", callback_data=f"service:{service.id}")
-    builder.button(text="В главное меню", callback_data="menu:home")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def masters_keyboard(masters: list[Master]) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for master in masters:
-        builder.button(
-            text=master.display_name,
-            callback_data=f"master:{master.id}",
-        )
-    builder.button(text="Назад к услугам", callback_data="booking:start")
-    builder.button(text="В главное меню", callback_data="menu:home")
+    builder.button(
+        text=get_specialist_template().button("home", "В главное меню"),
+        callback_data="menu:home",
+    )
     builder.adjust(1)
     return builder.as_markup()
 
@@ -65,8 +81,14 @@ def dates_keyboard(dates: list[date]) -> InlineKeyboardMarkup:
             text=f"{WEEKDAYS_RU[item.weekday()]}, {item:%d.%m}",
             callback_data=f"date:{item.isoformat()}",
         )
-    builder.button(text="Назад к мастерам", callback_data="booking:back:masters")
-    builder.button(text="В главное меню", callback_data="menu:home")
+    builder.button(
+        text=get_specialist_template().button("back_to_services", "Назад к услугам"),
+        callback_data="booking:start",
+    )
+    builder.button(
+        text=get_specialist_template().button("home", "В главное меню"),
+        callback_data="menu:home",
+    )
     builder.adjust(2)
     return builder.as_markup()
 
@@ -79,29 +101,56 @@ def slots_keyboard(slots: list[BookableSlot], timezone) -> InlineKeyboardMarkup:
             text=local_start.strftime("%H:%M"),
             callback_data=f"slot:{int(slot.service_start.timestamp())}",
         )
-    builder.button(text="Назад к датам", callback_data="booking:back:dates")
-    builder.button(text="В главное меню", callback_data="menu:home")
+    template = get_specialist_template()
+    builder.button(
+        text=template.button("back_to_dates", "Назад к датам"),
+        callback_data="booking:back:dates",
+    )
+    builder.button(
+        text=template.button("home", "В главное меню"),
+        callback_data="menu:home",
+    )
     builder.adjust(3)
     return builder.as_markup()
 
 
 def confirmation_keyboard() -> InlineKeyboardMarkup:
+    template = get_specialist_template()
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Подтвердить запись", callback_data="booking:confirm")],
-            [InlineKeyboardButton(text="Отменить", callback_data="booking:abort")],
+            [
+                InlineKeyboardButton(
+                    text=template.button("confirm_booking", "Подтвердить запись"),
+                    callback_data="booking:confirm",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=template.button("cancel", "Отменить"),
+                    callback_data="booking:abort",
+                )
+            ],
         ]
     )
 
 
 def phone_keyboard() -> ReplyKeyboardMarkup:
+    template = get_specialist_template()
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Отправить мой телефон", request_contact=True)],
+            [
+                KeyboardButton(
+                    text=template.button("share_phone", "Отправить мой телефон"),
+                    request_contact=True,
+                )
+            ],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
-        input_field_placeholder="Нажмите кнопку или введите номер",
+        input_field_placeholder=template.button(
+            "phone_placeholder",
+            "Нажмите кнопку или введите номер",
+        ),
     )
 
 
@@ -150,7 +199,10 @@ def master_appointments_keyboard(
             text=f"{item.local_start:%d.%m %H:%M} · {item.service_name}",
             callback_data=f"master:appointment:{item.appointment_id}",
         )
-    builder.button(text="Кабинет мастера", callback_data="master:menu")
+    builder.button(
+        text=get_specialist_template().button("specialist_cabinet", "Мой кабинет"),
+        callback_data="master:menu",
+    )
     builder.adjust(1)
     return builder.as_markup()
 

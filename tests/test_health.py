@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator
 
 from httpx import ASGITransport, AsyncClient
 
+from booking_bot.config import Settings, get_settings
 from booking_bot.db.session import get_session
 from booking_bot.main import create_app
 
@@ -32,3 +33,30 @@ async def test_readiness_with_available_database() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
+
+
+async def test_single_webhook_rejects_invalid_header_secret() -> None:
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        telegram_bot_token="123456:test-token",
+        telegram_webhook_header_secret="expected-secret",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/webhooks/telegram",
+            headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
+            json={"update_id": 1},
+        )
+
+    assert response.status_code == 403
+
+
+async def test_multi_bot_webhook_path_no_longer_exists() -> None:
+    app = create_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/webhooks/telegram/legacy-bot-secret",
+            json={"update_id": 1},
+        )
+
+    assert response.status_code == 404
