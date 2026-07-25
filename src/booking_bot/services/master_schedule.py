@@ -16,6 +16,7 @@ from booking_bot.db.models import (
     Master,
     NotificationJob,
     ScheduleException,
+    TelegramUser,
     TimeBlock,
     WorkingRule,
 )
@@ -50,9 +51,12 @@ class MasterAppointment:
     service_name: str
     client_name: str | None
     client_phone: str | None
+    client_comment: str | None
+    internal_note: str | None
     location_name: str | None
     local_start: datetime
     local_end: datetime
+    duration_minutes: int
     status: str
 
 
@@ -202,7 +206,9 @@ class MasterScheduleService:
         appointment.status = new_status
         appointment.lock_version += 1
         entry = await session.get(CalendarEntry, appointment.calendar_entry_id)
-        if new_status == AppointmentStatus.CONFIRMED.value:
+        client = await session.get(TelegramUser, appointment.client_id)
+        can_notify_client = client is not None and client.telegram_user_id is not None
+        if new_status == AppointmentStatus.CONFIRMED.value and can_notify_client:
             session.add(
                 NotificationJob(
                     business_id=business_id,
@@ -224,16 +230,17 @@ class MasterScheduleService:
                 )
                 .values(state=NotificationJobState.CANCELLED.value)
             )
-            session.add(
-                NotificationJob(
-                    business_id=business_id,
-                    appointment_id=appointment.id,
-                    recipient_user_id=appointment.client_id,
-                    kind="client_appointment_cancelled",
-                    scheduled_for=now,
-                    state=NotificationJobState.PENDING.value,
+            if can_notify_client:
+                session.add(
+                    NotificationJob(
+                        business_id=business_id,
+                        appointment_id=appointment.id,
+                        recipient_user_id=appointment.client_id,
+                        kind="client_appointment_cancelled",
+                        scheduled_for=now,
+                        state=NotificationJobState.PENDING.value,
+                    )
                 )
-            )
 
         session.add(
             AppointmentHistory(
@@ -243,6 +250,121 @@ class MasterScheduleService:
                 event_type="status_changed_by_master",
                 from_status=previous_status,
                 to_status=new_status,
+            )
+        )
+        await session.flush()
+        return await self.get_appointment(
+            session,
+            business_id=business_id,
+            master=master,
+            appointment_id=appointment.id,
+        )
+
+    async def change_appointment_duration(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        master: Master,
+        appointment_id: UUID,
+        actor_user_id: UUID,
+        duration_minutes: int,
+    ) -> MasterAppointment:
+        if not 5 <= duration_minutes <= 1440:
+            raise ValueError("Duration must be between 5 and 1440 minutes")
+        row = (
+            await session.execute(
+                select(Appointment, CalendarEntry)
+                .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+                .where(
+                    Appointment.id == appointment_id,
+                    Appointment.business_id == business_id,
+                    CalendarEntry.master_id == master.id,
+                    CalendarEntry.state == CalendarEntryState.ACTIVE.value,
+                    Appointment.status.in_(
+                        [
+                            AppointmentStatus.PENDING_APPROVAL.value,
+                            AppointmentStatus.CONFIRMED.value,
+                        ]
+                    ),
+                )
+                .with_for_update()
+            )
+        ).one_or_none()
+        if row is None:
+            raise AppointmentNotFoundError
+        appointment, entry = row
+        old_duration = appointment.duration_minutes
+        buffer_after = max(entry.ends_at - appointment.service_ends_at, timedelta())
+        new_service_end = appointment.service_starts_at + timedelta(minutes=duration_minutes)
+        try:
+            async with session.begin_nested():
+                appointment.service_ends_at = new_service_end
+                appointment.duration_minutes = duration_minutes
+                appointment.lock_version += 1
+                entry.ends_at = new_service_end + buffer_after
+                await session.flush()
+        except IntegrityError as exc:
+            raise ScheduleConflictError(
+                "The changed duration overlaps another calendar entry"
+            ) from exc
+        session.add(
+            AppointmentHistory(
+                business_id=business_id,
+                appointment_id=appointment.id,
+                actor_user_id=actor_user_id,
+                event_type="duration_changed_by_master",
+                from_status=appointment.status,
+                to_status=appointment.status,
+                event_payload={
+                    "old_duration_minutes": old_duration,
+                    "new_duration_minutes": duration_minutes,
+                },
+            )
+        )
+        await session.flush()
+        return await self.get_appointment(
+            session,
+            business_id=business_id,
+            master=master,
+            appointment_id=appointment.id,
+        )
+
+    async def set_internal_note(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        master: Master,
+        appointment_id: UUID,
+        actor_user_id: UUID,
+        note: str | None,
+    ) -> MasterAppointment:
+        normalized_note = (note.strip() or None) if note else None
+        if normalized_note and len(normalized_note) > 4000:
+            raise ValueError("Internal note is too long")
+        appointment = await session.scalar(
+            select(Appointment)
+            .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+            .where(
+                Appointment.id == appointment_id,
+                Appointment.business_id == business_id,
+                CalendarEntry.master_id == master.id,
+            )
+            .with_for_update()
+        )
+        if appointment is None:
+            raise AppointmentNotFoundError
+        appointment.internal_note = normalized_note
+        appointment.lock_version += 1
+        session.add(
+            AppointmentHistory(
+                business_id=business_id,
+                appointment_id=appointment.id,
+                actor_user_id=actor_user_id,
+                event_type="internal_note_changed_by_master",
+                from_status=appointment.status,
+                to_status=appointment.status,
             )
         )
         await session.flush()
@@ -545,8 +667,11 @@ class MasterScheduleService:
             service_name=appointment.service_name_snapshot,
             client_name=appointment.client_name_snapshot,
             client_phone=appointment.client_phone_snapshot,
+            client_comment=appointment.client_comment,
+            internal_note=appointment.internal_note,
             location_name=location.name if location else None,
             local_start=appointment.service_starts_at.astimezone(timezone),
             local_end=appointment.service_ends_at.astimezone(timezone),
+            duration_minutes=appointment.duration_minutes,
             status=appointment.status,
         )

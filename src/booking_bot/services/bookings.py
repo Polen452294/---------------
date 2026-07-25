@@ -29,6 +29,8 @@ from booking_bot.domain.enums import (
     NotificationJobState,
 )
 from booking_bot.services.availability import AvailabilityService, BookableSlot
+from booking_bot.services.reminder_settings import get_client_reminder_settings
+from booking_bot.services.users import normalize_phone
 
 
 class SlotUnavailableError(RuntimeError):
@@ -55,6 +57,10 @@ class AppointmentChangeNotAllowedError(RuntimeError):
     pass
 
 
+class ManualClientValidationError(ValueError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class HoldSummary:
     hold_id: UUID
@@ -71,9 +77,11 @@ class HoldSummary:
 @dataclass(frozen=True, slots=True)
 class AppointmentSummary:
     appointment_id: UUID
+    service_id: UUID | None
     service_name: str
     master_name: str
     location_name: str | None
+    location_address: str | None
     local_start: datetime
     local_end: datetime
     status: str
@@ -97,6 +105,8 @@ class BookingService:
         service_start: datetime,
         local_date: date,
         now: datetime | None = None,
+        respect_min_lead_time: bool = True,
+        duration_minutes_override: int | None = None,
     ) -> SlotHold:
         now = now or datetime.now(UTC)
         if service_start.tzinfo is None:
@@ -109,6 +119,8 @@ class BookingService:
             service_id=service_id,
             local_date=local_date,
             now=now,
+            respect_min_lead_time=respect_min_lead_time,
+            duration_minutes_override=duration_minutes_override,
         )
         selected = self._find_slot(slots, service_start.astimezone(UTC))
         if selected is None:
@@ -187,6 +199,10 @@ class BookingService:
         hold_id: UUID,
         client_id: UUID,
         now: datetime | None = None,
+        created_by_user_id: UUID | None = None,
+        force_confirmed: bool = False,
+        notify_master: bool = True,
+        client_comment: str | None = None,
     ) -> AppointmentSummary:
         now = now or datetime.now(UTC)
         hold = await session.scalar(
@@ -235,11 +251,10 @@ class BookingService:
             if master_service and master_service.price_override_minor is not None
             else service.price_minor
         )
-        appointment_status = (
-            AppointmentStatus.PENDING_APPROVAL.value
-            if service.requires_approval
-            else AppointmentStatus.CONFIRMED.value
-        )
+        appointment_status = AppointmentStatus.CONFIRMED.value
+        if service.requires_approval and not force_confirmed:
+            appointment_status = AppointmentStatus.PENDING_APPROVAL.value
+        actor_user_id = created_by_user_id or client.id
 
         entry.kind = CalendarEntryKind.APPOINTMENT.value
         hold.status = HoldStatus.CONVERTED.value
@@ -251,7 +266,7 @@ class BookingService:
             calendar_entry_id=entry.id,
             service_id=service.id,
             client_id=client.id,
-            created_by_user_id=client.id,
+            created_by_user_id=actor_user_id,
             status=appointment_status,
             service_name_snapshot=service.name,
             service_starts_at=hold.service_starts_at,
@@ -263,6 +278,7 @@ class BookingService:
             currency=service.currency,
             client_name_snapshot=client_name,
             client_phone_snapshot=client.phone,
+            client_comment=client_comment,
         )
         session.add(appointment)
         await session.flush()
@@ -270,8 +286,10 @@ class BookingService:
             AppointmentHistory(
                 business_id=business.id,
                 appointment_id=appointment.id,
-                actor_user_id=client.id,
-                event_type="created_from_hold",
+                actor_user_id=actor_user_id,
+                event_type=(
+                    "created_by_master" if actor_user_id != client.id else "created_from_hold"
+                ),
                 to_status=appointment_status,
             )
         )
@@ -282,21 +300,92 @@ class BookingService:
             master=master,
             business=business,
             now=now,
+            notify_master=notify_master,
         )
         await session.flush()
 
         timezone = ZoneInfo(master.timezone or business.timezone)
         return AppointmentSummary(
             appointment_id=appointment.id,
+            service_id=appointment.service_id,
             service_name=appointment.service_name_snapshot,
             master_name=master.display_name,
             location_name=location.name if location else None,
+            location_address=location.address if location else None,
             local_start=appointment.service_starts_at.astimezone(timezone),
             local_end=appointment.service_ends_at.astimezone(timezone),
             status=appointment.status,
             can_change=self._can_change(appointment, now),
             change_deadline=appointment.service_starts_at.astimezone(timezone)
             - timedelta(hours=self._settings.cancellation_cutoff_hours),
+        )
+
+    async def confirm_manual_hold(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        hold_id: UUID,
+        holder_user_id: UUID,
+        actor_user_id: UUID,
+        client_name: str,
+        client_phone: str,
+        client_comment: str | None = None,
+        now: datetime | None = None,
+    ) -> AppointmentSummary:
+        now = now or datetime.now(UTC)
+        normalized_name = " ".join(client_name.split())
+        normalized_phone = normalize_phone(client_phone)
+        normalized_comment = client_comment.strip() if client_comment else None
+        if not 2 <= len(normalized_name) <= 160:
+            raise ManualClientValidationError("Client name must contain 2-160 characters")
+        if normalized_phone is None:
+            raise ManualClientValidationError("Client phone must contain 5-32 characters")
+        if normalized_comment and len(normalized_comment) > 2000:
+            raise ManualClientValidationError("Client comment is too long")
+
+        hold = await session.scalar(
+            select(SlotHold)
+            .where(
+                SlotHold.id == hold_id,
+                SlotHold.business_id == business_id,
+                SlotHold.client_id == holder_user_id,
+            )
+            .with_for_update()
+        )
+        if hold is None:
+            raise HoldNotFoundError
+        entry = await session.get(CalendarEntry, hold.calendar_entry_id)
+        if (
+            hold.status != HoldStatus.ACTIVE.value
+            or hold.expires_at <= now
+            or entry is None
+            or entry.state != CalendarEntryState.ACTIVE.value
+        ):
+            if entry is not None and entry.state == CalendarEntryState.ACTIVE.value:
+                entry.state = CalendarEntryState.EXPIRED.value
+            hold.status = HoldStatus.EXPIRED.value
+            await session.flush()
+            raise HoldExpiredError("The slot hold has expired")
+
+        manual_client = TelegramUser(
+            telegram_user_id=None,
+            first_name=normalized_name,
+            phone=normalized_phone,
+        )
+        session.add(manual_client)
+        await session.flush()
+        hold.client_id = manual_client.id
+        await session.flush()
+        return await self.confirm_hold(
+            session,
+            hold_id=hold.id,
+            client_id=manual_client.id,
+            now=now,
+            created_by_user_id=actor_user_id,
+            force_confirmed=True,
+            notify_master=False,
+            client_comment=normalized_comment,
         )
 
     async def release_hold(
@@ -353,23 +442,101 @@ class BookingService:
             )
         ).all()
         return [
-            AppointmentSummary(
-                appointment_id=appointment.id,
-                service_name=appointment.service_name_snapshot,
-                master_name=master.display_name,
-                location_name=location.name if location else None,
-                local_start=appointment.service_starts_at.astimezone(
-                    ZoneInfo(master.timezone or business.timezone)
-                ),
-                local_end=appointment.service_ends_at.astimezone(
-                    ZoneInfo(master.timezone or business.timezone)
-                ),
-                status=appointment.status,
-                can_change=self._can_change(appointment, now),
-                change_deadline=appointment.service_starts_at.astimezone(
-                    ZoneInfo(master.timezone or business.timezone)
-                )
-                - timedelta(hours=self._settings.cancellation_cutoff_hours),
+            self._appointment_summary(
+                appointment=appointment,
+                master=master,
+                business=business,
+                location=location,
+                now=now,
+            )
+            for appointment, _entry, master, business, location in rows
+        ]
+
+    async def list_past(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        client_id: UUID,
+        now: datetime | None = None,
+        limit: int = 20,
+    ) -> list[AppointmentSummary]:
+        now = now or datetime.now(UTC)
+        return await self._list_client_appointments(
+            session,
+            business_id=business_id,
+            client_id=client_id,
+            statuses=[
+                AppointmentStatus.PENDING_APPROVAL.value,
+                AppointmentStatus.PENDING_PAYMENT.value,
+                AppointmentStatus.CONFIRMED.value,
+                AppointmentStatus.COMPLETED.value,
+                AppointmentStatus.NO_SHOW.value,
+            ],
+            before=now,
+            now=now,
+            limit=limit,
+        )
+
+    async def list_cancelled(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        client_id: UUID,
+        now: datetime | None = None,
+        limit: int = 20,
+    ) -> list[AppointmentSummary]:
+        now = now or datetime.now(UTC)
+        return await self._list_client_appointments(
+            session,
+            business_id=business_id,
+            client_id=client_id,
+            statuses=[
+                AppointmentStatus.CANCELLED_BY_CLIENT.value,
+                AppointmentStatus.CANCELLED_BY_MASTER.value,
+            ],
+            now=now,
+            limit=limit,
+        )
+
+    async def _list_client_appointments(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        client_id: UUID,
+        statuses: list[str],
+        now: datetime,
+        before: datetime | None = None,
+        limit: int,
+    ) -> list[AppointmentSummary]:
+        query = (
+            select(Appointment, CalendarEntry, Master, Business, Location)
+            .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+            .join(Master, Master.id == CalendarEntry.master_id)
+            .join(Business, Business.id == Appointment.business_id)
+            .outerjoin(Location, Location.id == CalendarEntry.location_id)
+            .where(
+                Appointment.business_id == business_id,
+                Appointment.client_id == client_id,
+                Appointment.status.in_(statuses),
+            )
+        )
+        if before is not None:
+            query = query.where(Appointment.service_starts_at < before)
+        rows = (
+            await session.execute(
+                query.order_by(Appointment.service_starts_at.desc()).limit(limit)
+            )
+        ).all()
+        return [
+            self._appointment_summary(
+                appointment=appointment,
+                master=master,
+                business=business,
+                location=location,
+                now=now,
             )
             for appointment, _entry, master, business, location in rows
         ]
@@ -553,7 +720,7 @@ class BookingService:
             session,
             appointment_id=appointment.id,
         )
-        self._schedule_client_reminders(
+        await self._schedule_client_reminders(
             session,
             appointment=appointment,
             client=client,
@@ -594,6 +761,138 @@ class BookingService:
             now=now,
         )
 
+    async def confirm_master_reschedule(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        master: Master,
+        appointment_id: UUID,
+        hold_id: UUID,
+        holder_user_id: UUID,
+        now: datetime | None = None,
+    ) -> AppointmentSummary:
+        now = now or datetime.now(UTC)
+        appointment = await session.scalar(
+            select(Appointment)
+            .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+            .where(
+                Appointment.id == appointment_id,
+                Appointment.business_id == business_id,
+                CalendarEntry.master_id == master.id,
+                Appointment.service_starts_at > now,
+                Appointment.status.in_(
+                    [
+                        AppointmentStatus.PENDING_APPROVAL.value,
+                        AppointmentStatus.CONFIRMED.value,
+                    ]
+                ),
+            )
+            .with_for_update()
+        )
+        if appointment is None:
+            raise AppointmentChangeNotAllowedError
+        hold = await session.scalar(
+            select(SlotHold)
+            .where(
+                SlotHold.id == hold_id,
+                SlotHold.business_id == business_id,
+                SlotHold.client_id == holder_user_id,
+            )
+            .with_for_update()
+        )
+        if hold is None:
+            raise HoldNotFoundError
+
+        old_entry = await session.get(CalendarEntry, appointment.calendar_entry_id)
+        new_entry = await session.get(CalendarEntry, hold.calendar_entry_id)
+        if (
+            hold.status != HoldStatus.ACTIVE.value
+            or hold.expires_at <= now
+            or new_entry is None
+            or new_entry.state != CalendarEntryState.ACTIVE.value
+        ):
+            if new_entry is not None and new_entry.state == CalendarEntryState.ACTIVE.value:
+                new_entry.state = CalendarEntryState.EXPIRED.value
+            hold.status = HoldStatus.EXPIRED.value
+            await session.flush()
+            raise HoldExpiredError("The slot hold has expired")
+        if (
+            old_entry is None
+            or hold.service_id != appointment.service_id
+            or new_entry.master_id != master.id
+            or old_entry.master_id != master.id
+        ):
+            raise AppointmentChangeNotAllowedError("The hold does not match the appointment")
+
+        business = await session.get(Business, business_id)
+        client = await session.get(TelegramUser, appointment.client_id)
+        location = (
+            await session.get(Location, new_entry.location_id)
+            if new_entry.location_id is not None
+            else None
+        )
+        if business is None or client is None:
+            raise AppointmentNotFoundError
+
+        old_starts_at = appointment.service_starts_at
+        old_ends_at = appointment.service_ends_at
+        old_entry.state = CalendarEntryState.RELEASED.value
+        new_entry.kind = CalendarEntryKind.APPOINTMENT.value
+        hold.status = HoldStatus.CONVERTED.value
+        appointment.calendar_entry_id = new_entry.id
+        appointment.service_starts_at = hold.service_starts_at
+        appointment.service_ends_at = hold.service_ends_at
+        appointment.duration_minutes = int(
+            (hold.service_ends_at - hold.service_starts_at).total_seconds() // 60
+        )
+        appointment.lock_version += 1
+
+        await self._cancel_pending_notifications(session, appointment_id=appointment.id)
+        await self._schedule_client_reminders(
+            session,
+            appointment=appointment,
+            client=client,
+            master=master,
+            business=business,
+            now=now,
+        )
+        if client.telegram_user_id is not None:
+            session.add(
+                NotificationJob(
+                    business_id=business_id,
+                    appointment_id=appointment.id,
+                    recipient_user_id=client.id,
+                    kind="client_appointment_rescheduled",
+                    scheduled_for=now,
+                    state=NotificationJobState.PENDING.value,
+                )
+            )
+        session.add(
+            AppointmentHistory(
+                business_id=business_id,
+                appointment_id=appointment.id,
+                actor_user_id=holder_user_id,
+                event_type="rescheduled_by_master",
+                from_status=appointment.status,
+                to_status=appointment.status,
+                event_payload={
+                    "old_starts_at": old_starts_at.isoformat(),
+                    "old_ends_at": old_ends_at.isoformat(),
+                    "new_starts_at": appointment.service_starts_at.isoformat(),
+                    "new_ends_at": appointment.service_ends_at.isoformat(),
+                },
+            )
+        )
+        await session.flush()
+        return self._appointment_summary(
+            appointment=appointment,
+            master=master,
+            business=business,
+            location=location,
+            now=now,
+        )
+
     async def _schedule_notifications(
         self,
         session: AsyncSession,
@@ -603,8 +902,9 @@ class BookingService:
         master: Master,
         business: Business,
         now: datetime,
+        notify_master: bool = True,
     ) -> None:
-        self._schedule_client_reminders(
+        await self._schedule_client_reminders(
             session,
             appointment=appointment,
             client=client,
@@ -612,16 +912,17 @@ class BookingService:
             business=business,
             now=now,
         )
-        self._schedule_master_notification(
-            session,
-            appointment=appointment,
-            master=master,
-            business=business,
-            kind="master_new_appointment",
-            now=now,
-        )
+        if notify_master:
+            self._schedule_master_notification(
+                session,
+                appointment=appointment,
+                master=master,
+                business=business,
+                kind="master_new_appointment",
+                now=now,
+            )
 
-    def _schedule_client_reminders(
+    async def _schedule_client_reminders(
         self,
         session: AsyncSession,
         *,
@@ -631,26 +932,144 @@ class BookingService:
         business: Business,
         now: datetime,
     ) -> None:
+        if client.telegram_user_id is None:
+            return
+        settings = await get_client_reminder_settings(
+            session,
+            business_id=business.id,
+            master_user_id=master.user_id,
+        )
         timezone = ZoneInfo(master.timezone or business.timezone)
         local_start = appointment.service_starts_at.astimezone(timezone)
-        day_of = datetime.combine(local_start.date(), time(9), timezone).astimezone(UTC)
+        day_of = datetime.combine(
+            local_start.date(),
+            time(settings.day_of_hour),
+            timezone,
+        ).astimezone(UTC)
         reminders = [
-            ("client_reminder_7d", appointment.service_starts_at - timedelta(days=7)),
-            ("client_reminder_3d", appointment.service_starts_at - timedelta(days=3)),
-            ("client_reminder_day_of", day_of),
+            (
+                "client_reminder_7d",
+                appointment.service_starts_at - timedelta(days=7),
+                settings.seven_days,
+            ),
+            (
+                "client_reminder_3d",
+                appointment.service_starts_at - timedelta(days=3),
+                settings.three_days,
+            ),
+            ("client_reminder_day_of", day_of, settings.day_of),
         ]
-        for kind, scheduled_for in reminders:
-            if now < scheduled_for < appointment.service_starts_at:
-                session.add(
-                    NotificationJob(
-                        business_id=business.id,
-                        appointment_id=appointment.id,
-                        recipient_user_id=client.id,
-                        kind=kind,
-                        scheduled_for=scheduled_for,
-                        state=NotificationJobState.PENDING.value,
+        for kind, scheduled_for, enabled in reminders:
+            if enabled and now < scheduled_for < appointment.service_starts_at:
+                existing = await session.scalar(
+                    select(NotificationJob).where(
+                        NotificationJob.appointment_id == appointment.id,
+                        NotificationJob.recipient_user_id == client.id,
+                        NotificationJob.kind == kind,
+                        NotificationJob.scheduled_for == scheduled_for,
                     )
                 )
+                if existing is None:
+                    session.add(
+                        NotificationJob(
+                            business_id=business.id,
+                            appointment_id=appointment.id,
+                            recipient_user_id=client.id,
+                            kind=kind,
+                            scheduled_for=scheduled_for,
+                            state=NotificationJobState.PENDING.value,
+                        )
+                    )
+                else:
+                    existing.state = NotificationJobState.PENDING.value
+                    existing.last_error = None
+
+    async def schedule_client_reminders_for_appointments(
+        self,
+        session: AsyncSession,
+        *,
+        appointment_ids: list[UUID],
+        now: datetime | None = None,
+    ) -> None:
+        if not appointment_ids:
+            return
+        now = now or datetime.now(UTC)
+        rows = (
+            await session.execute(
+                select(Appointment, CalendarEntry, Master, Business, TelegramUser)
+                .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+                .join(Master, Master.id == CalendarEntry.master_id)
+                .join(Business, Business.id == Appointment.business_id)
+                .join(TelegramUser, TelegramUser.id == Appointment.client_id)
+                .where(
+                    Appointment.id.in_(appointment_ids),
+                    Appointment.service_starts_at > now,
+                    Appointment.status.in_(
+                        [
+                            AppointmentStatus.PENDING_APPROVAL.value,
+                            AppointmentStatus.PENDING_PAYMENT.value,
+                            AppointmentStatus.CONFIRMED.value,
+                        ]
+                    ),
+                )
+            )
+        ).all()
+        for appointment, _entry, master, business, client in rows:
+            await self._schedule_client_reminders(
+                session,
+                appointment=appointment,
+                client=client,
+                master=master,
+                business=business,
+                now=now,
+            )
+        await session.flush()
+
+    async def rebuild_client_reminders_for_master(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        master: Master,
+        now: datetime | None = None,
+    ) -> None:
+        now = now or datetime.now(UTC)
+        appointment_ids = list(
+            (
+                await session.scalars(
+                    select(Appointment.id)
+                    .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+                    .where(
+                        Appointment.business_id == business_id,
+                        CalendarEntry.master_id == master.id,
+                        Appointment.service_starts_at > now,
+                        Appointment.status.in_(
+                            [
+                                AppointmentStatus.PENDING_APPROVAL.value,
+                                AppointmentStatus.PENDING_PAYMENT.value,
+                                AppointmentStatus.CONFIRMED.value,
+                            ]
+                        ),
+                    )
+                )
+            ).all()
+        )
+        if not appointment_ids:
+            return
+        await session.execute(
+            update(NotificationJob)
+            .where(
+                NotificationJob.appointment_id.in_(appointment_ids),
+                NotificationJob.kind.startswith("client_reminder_"),
+                NotificationJob.state == NotificationJobState.PENDING.value,
+            )
+            .values(state=NotificationJobState.CANCELLED.value)
+        )
+        await self.schedule_client_reminders_for_appointments(
+            session,
+            appointment_ids=appointment_ids,
+            now=now,
+        )
 
     @staticmethod
     def _schedule_master_notification(
@@ -726,9 +1145,11 @@ class BookingService:
         local_start = appointment.service_starts_at.astimezone(timezone)
         return AppointmentSummary(
             appointment_id=appointment.id,
+            service_id=appointment.service_id,
             service_name=appointment.service_name_snapshot,
             master_name=master.display_name,
             location_name=location.name if location else None,
+            location_address=location.address if location else None,
             local_start=local_start,
             local_end=appointment.service_ends_at.astimezone(timezone),
             status=appointment.status,

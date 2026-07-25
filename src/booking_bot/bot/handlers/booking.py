@@ -1,4 +1,3 @@
-import re
 from datetime import UTC, date, datetime, timedelta
 from html import escape
 from uuid import UUID
@@ -6,13 +5,14 @@ from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
+from aiogram.types import BufferedInputFile, CallbackQuery, Message, ReplyKeyboardRemove
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from booking_bot.bot.keyboards import (
     client_appointment_actions_keyboard,
     client_appointments_keyboard,
+    client_booking_sections_keyboard,
     client_cancel_confirmation_keyboard,
     confirmation_keyboard,
     dates_keyboard,
@@ -45,7 +45,11 @@ from booking_bot.services.bookings import (
     HoldSummary,
     SlotUnavailableError,
 )
-from booking_bot.services.users import get_or_create_telegram_user, set_user_phone
+from booking_bot.services.users import (
+    get_or_create_telegram_user,
+    normalize_phone,
+    set_user_phone,
+)
 from booking_bot.specialist_config import get_specialist_template
 
 router = Router(name="booking")
@@ -104,11 +108,15 @@ def _format_appointment(summary: AppointmentSummary) -> str:
         "no_show": "Не состоялась",
     }
     location = f"\nАдрес: <b>{escape(summary.location_name)}</b>" if summary.location_name else ""
-    change_note = (
-        f"\n\nПеренос и отмена доступны до <b>{summary.change_deadline:%d.%m.%Y %H:%M}</b>."
-        if summary.can_change
-        else "\n\nСрок самостоятельного переноса и отмены уже истёк."
-    )
+    active = summary.status in {"pending_approval", "pending_payment", "confirmed"}
+    change_note = ""
+    if active:
+        change_note = (
+            f"\n\nПеренос и отмена доступны до "
+            f"<b>{summary.change_deadline:%d.%m.%Y %H:%M}</b>."
+            if summary.can_change
+            else "\n\nСрок самостоятельного переноса и отмены уже истёк."
+        )
     return (
         f"<b>{escape(summary.service_name)}</b>\n\n"
         f"Статус: <b>{status_labels.get(summary.status, escape(summary.status))}</b>\n"
@@ -117,6 +125,39 @@ def _format_appointment(summary: AppointmentSummary) -> str:
         f"Время: <b>{summary.local_start:%H:%M}-{summary.local_end:%H:%M}</b>"
         f"{location}{change_note}"
     )
+
+
+def _ics_escape(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+
+
+def _build_appointment_ics(summary: AppointmentSummary) -> bytes:
+    location = ", ".join(
+        value for value in (summary.location_name, summary.location_address) if value
+    )
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Telegram Specialist Booking Bot//RU",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "BEGIN:VEVENT",
+        f"UID:{summary.appointment_id}@telegram-booking-bot",
+        f"DTSTAMP:{datetime.now(UTC):%Y%m%dT%H%M%SZ}",
+        f"DTSTART:{summary.local_start.astimezone(UTC):%Y%m%dT%H%M%SZ}",
+        f"DTEND:{summary.local_end.astimezone(UTC):%Y%m%dT%H%M%SZ}",
+        f"SUMMARY:{_ics_escape(summary.service_name)}",
+        f"DESCRIPTION:{_ics_escape('Запись к специалисту ' + summary.master_name)}",
+    ]
+    if location:
+        lines.append(f"LOCATION:{_ics_escape(location)}")
+    lines.extend(["END:VEVENT", "END:VCALENDAR", ""])
+    return "\r\n".join(lines).encode("utf-8")
 
 
 async def _show_confirmation(
@@ -439,6 +480,7 @@ async def receive_contact(
     message: Message,
     state: FSMContext,
     db_session: AsyncSession,
+    business_id: UUID,
 ) -> None:
     if message.from_user is None or message.contact is None:
         return
@@ -450,7 +492,15 @@ async def receive_contact(
     if user is None:
         await state.clear()
         return
-    await set_user_phone(db_session, user, message.contact.phone_number)
+    merged_appointment_ids = await set_user_phone(
+        db_session,
+        user,
+        message.contact.phone_number,
+    )
+    await BookingService(_settings()).schedule_client_reminders_for_appointments(
+        db_session,
+        appointment_ids=merged_appointment_ids,
+    )
     await message.answer("Телефон сохранен.", reply_markup=ReplyKeyboardRemove())
     await _show_confirmation(message, state, db_session)
 
@@ -460,19 +510,23 @@ async def receive_phone_text(
     message: Message,
     state: FSMContext,
     db_session: AsyncSession,
+    business_id: UUID,
 ) -> None:
     raw_phone = message.text or ""
-    digits = re.sub(r"\D", "", raw_phone)
-    if not 10 <= len(digits) <= 15:
+    normalized = normalize_phone(raw_phone)
+    if normalized is None:
         await message.answer("Введите телефон из 10-15 цифр или используйте кнопку ниже.")
         return
-    normalized = f"+{digits}" if raw_phone.strip().startswith("+") else digits
     data = await state.get_data()
     user = await db_session.get(TelegramUser, UUID(data["client_id"]))
     if user is None:
         await state.clear()
         return
-    await set_user_phone(db_session, user, normalized)
+    merged_appointment_ids = await set_user_phone(db_session, user, normalized)
+    await BookingService(_settings()).schedule_client_reminders_for_appointments(
+        db_session,
+        appointment_ids=merged_appointment_ids,
+    )
     await message.answer("Телефон сохранен.", reply_markup=ReplyKeyboardRemove())
     await _show_confirmation(message, state, db_session)
 
@@ -565,23 +619,67 @@ async def my_bookings(
     db_session: AsyncSession,
     business_id: UUID,
 ) -> None:
-    user = await get_or_create_telegram_user(db_session, callback.from_user)
-    appointments = await BookingService(_settings()).list_upcoming(
-        db_session,
-        business_id=business_id,
-        client_id=user.id,
-    )
+    await get_or_create_telegram_user(db_session, callback.from_user)
     await state.clear()
-    if not appointments:
-        text = _template().text(
-            "no_upcoming_bookings",
-            "У вас пока нет предстоящих записей.",
+    await _edit_or_answer(
+        callback,
+        "<b>Мои записи</b>\n\nВыберите раздел:",
+        reply_markup=client_booking_sections_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("booking:list:"))
+async def client_booking_list(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if callback.from_user is None:
+        return
+    scope = (callback.data or "").rsplit(":", 1)[-1]
+    user = await get_or_create_telegram_user(db_session, callback.from_user)
+    service = BookingService(_settings())
+    if scope == "upcoming":
+        appointments = await service.list_upcoming(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
         )
-        reply_markup = main_menu_keyboard()
+        title = "Предстоящие записи"
+    elif scope == "past":
+        appointments = await service.list_past(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
+        )
+        title = "Прошлые записи"
+    elif scope == "cancelled":
+        appointments = await service.list_cancelled(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
+        )
+        title = "Отменённые записи"
     else:
-        text = "Ваши предстоящие записи:\n\nВыберите запись, чтобы посмотреть детали."
-        reply_markup = client_appointments_keyboard(appointments)
-    await _edit_or_answer(callback, text, reply_markup=reply_markup)
+        await callback.answer("Неизвестный раздел", show_alert=True)
+        return
+    await state.clear()
+    text = (
+        f"<b>{title}</b>\n\nВыберите запись, чтобы посмотреть детали."
+        if appointments
+        else f"<b>{title}</b>\n\nЗдесь пока нет записей."
+    )
+    await _edit_or_answer(
+        callback,
+        text,
+        reply_markup=(
+            client_appointments_keyboard(appointments)
+            if appointments
+            else client_booking_sections_keyboard()
+        ),
+    )
     await callback.answer()
 
 
@@ -617,6 +715,134 @@ async def view_client_appointment(
         reply_markup=client_appointment_actions_keyboard(summary),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("appt:repeat:"))
+async def repeat_client_appointment(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+    specialist_master_id: UUID,
+) -> None:
+    if callback.from_user is None:
+        return
+    try:
+        appointment_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("Некорректная запись", show_alert=True)
+        return
+    user = await get_or_create_telegram_user(db_session, callback.from_user)
+    try:
+        summary = await BookingService(_settings()).get_appointment(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
+            appointment_id=appointment_id,
+        )
+    except AppointmentNotFoundError:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    if summary.service_id is None:
+        await callback.answer("Эта услуга больше недоступна", show_alert=True)
+        return
+    available = await db_session.scalar(
+        select(MasterService.id)
+        .join(Service, Service.id == MasterService.service_id)
+        .where(
+            MasterService.business_id == business_id,
+            MasterService.master_id == specialist_master_id,
+            MasterService.service_id == summary.service_id,
+            MasterService.is_active.is_(True),
+            Service.is_active.is_(True),
+        )
+    )
+    if available is None:
+        await callback.answer("Эта услуга сейчас недоступна", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        service_id=str(summary.service_id),
+        master_id=str(specialist_master_id),
+    )
+    await _show_dates(callback, state, db_session, business_id)
+
+
+@router.callback_query(F.data.startswith("appt:contact:"))
+async def contact_specialist(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if callback.from_user is None:
+        return
+    try:
+        appointment_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("Некорректная запись", show_alert=True)
+        return
+    client = await get_or_create_telegram_user(db_session, callback.from_user)
+    specialist_user = await db_session.scalar(
+        select(TelegramUser)
+        .join(Master, Master.user_id == TelegramUser.id)
+        .join(CalendarEntry, CalendarEntry.master_id == Master.id)
+        .join(Appointment, Appointment.calendar_entry_id == CalendarEntry.id)
+        .where(
+            Appointment.id == appointment_id,
+            Appointment.business_id == business_id,
+            Appointment.client_id == client.id,
+        )
+    )
+    if (
+        specialist_user is None
+        or specialist_user.telegram_user_id is None
+        or not isinstance(callback.message, Message)
+    ):
+        await callback.answer("Контакт специалиста пока не указан", show_alert=True)
+        return
+    if specialist_user.username:
+        link = f"https://t.me/{specialist_user.username}"
+    else:
+        link = f"tg://user?id={specialist_user.telegram_user_id}"
+    await callback.message.answer(
+        f'Связаться со специалистом: <a href="{link}">открыть чат</a>'
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("appt:ics:"))
+async def download_appointment_calendar(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if callback.from_user is None or not isinstance(callback.message, Message):
+        return
+    try:
+        appointment_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("Некорректная запись", show_alert=True)
+        return
+    client = await get_or_create_telegram_user(db_session, callback.from_user)
+    try:
+        summary = await BookingService(_settings()).get_appointment(
+            db_session,
+            business_id=business_id,
+            client_id=client.id,
+            appointment_id=appointment_id,
+        )
+    except AppointmentNotFoundError:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    document = BufferedInputFile(
+        _build_appointment_ics(summary),
+        filename=f"appointment-{summary.local_start:%Y-%m-%d}.ics",
+    )
+    await callback.message.answer_document(
+        document,
+        caption="Событие для Google Calendar, Apple Calendar и Outlook.",
+    )
+    await callback.answer("Файл календаря готов")
 
 
 @router.callback_query(F.data.startswith("appt:c:"))

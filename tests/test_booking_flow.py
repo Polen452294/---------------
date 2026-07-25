@@ -1,5 +1,6 @@
 from datetime import UTC, date, datetime, time, timedelta
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select
@@ -26,11 +27,15 @@ from booking_bot.domain.enums import (
     HoldStatus,
     NotificationJobState,
 )
+from booking_bot.services.analytics import MasterAnalyticsService, build_analytics_period
 from booking_bot.services.availability import AvailabilityService
 from booking_bot.services.bookings import (
     AppointmentChangeNotAllowedError,
     BookingService,
 )
+from booking_bot.services.master_schedule import MasterScheduleService
+from booking_bot.services.reminder_settings import update_client_reminder_settings
+from booking_bot.services.users import set_user_phone
 
 
 @pytest.mark.integration
@@ -471,4 +476,446 @@ async def test_client_cannot_change_appointment_inside_cutoff() -> None:
                 now=inside_cutoff,
             )
         assert appointment.status == AppointmentStatus.CONFIRMED.value
+        await session.rollback()
+
+
+@pytest.mark.integration
+async def test_master_can_create_and_cancel_manual_phone_booking() -> None:
+    settings = Settings(cancellation_cutoff_hours=24)
+    now = datetime(2026, 7, 20, 6, tzinfo=UTC)
+    booking_date = date(2026, 8, 3)
+    manual_date = date(2026, 8, 10)
+    async with async_session_factory() as session:
+        (
+            business,
+            _client,
+            master,
+            service,
+            _appointment,
+            _hold,
+            booking,
+        ) = await _create_confirmed_appointment(
+            session,
+            settings=settings,
+            now=now,
+            booking_date=booking_date,
+        )
+        assert master.user_id is not None
+        selected = (
+            await AvailabilityService(settings).list_slots(
+                session,
+                business_id=business.id,
+                master_id=master.id,
+                service_id=service.id,
+                local_date=manual_date,
+                now=now,
+            )
+        )[0]
+        hold = await booking.create_hold(
+            session,
+            business_id=business.id,
+            master_id=master.id,
+            service_id=service.id,
+            client_id=master.user_id,
+            service_start=selected.service_start,
+            local_date=manual_date,
+            now=now,
+        )
+        summary = await booking.confirm_manual_hold(
+            session,
+            business_id=business.id,
+            hold_id=hold.id,
+            holder_user_id=master.user_id,
+            actor_user_id=master.user_id,
+            client_name="Мария Петрова",
+            client_phone="+79991112233",
+            client_comment="Референс получен в переписке",
+            now=now,
+        )
+        appointment = await session.get(Appointment, summary.appointment_id)
+        assert appointment is not None
+        assert appointment.status == AppointmentStatus.CONFIRMED.value
+        assert appointment.created_by_user_id == master.user_id
+        assert appointment.client_name_snapshot == "Мария Петрова"
+        assert appointment.client_phone_snapshot == "+79991112233"
+        assert appointment.client_comment == "Референс получен в переписке"
+        manual_client = await session.get(TelegramUser, appointment.client_id)
+        assert manual_client is not None
+        assert manual_client.telegram_user_id is None
+        assert manual_client.phone == "+79991112233"
+        jobs = list(
+            (
+                await session.scalars(
+                    select(NotificationJob).where(NotificationJob.appointment_id == appointment.id)
+                )
+            ).all()
+        )
+        assert jobs == []
+        history = await session.scalar(
+            select(AppointmentHistory).where(
+                AppointmentHistory.appointment_id == appointment.id,
+                AppointmentHistory.event_type == "created_by_master",
+            )
+        )
+        assert history is not None
+
+        schedule = MasterScheduleService()
+        item = await schedule.get_appointment(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=appointment.id,
+        )
+        assert item.client_comment == "Референс получен в переписке"
+        await schedule.change_appointment_status(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=appointment.id,
+            actor_user_id=master.user_id,
+            new_status=AppointmentStatus.CANCELLED_BY_MASTER.value,
+            now=now,
+        )
+        cancellation_jobs = list(
+            (
+                await session.scalars(
+                    select(NotificationJob).where(NotificationJob.appointment_id == appointment.id)
+                )
+            ).all()
+        )
+        assert cancellation_jobs == []
+        await session.rollback()
+
+
+@pytest.mark.integration
+async def test_master_analytics_counts_statuses_clients_and_values() -> None:
+    settings = Settings()
+    created_at = datetime(2026, 7, 20, 6, tzinfo=UTC)
+    first_date = date(2026, 8, 3)
+    second_date = date(2026, 8, 10)
+    third_date = date(2026, 8, 17)
+    async with async_session_factory() as session:
+        (
+            business,
+            _client,
+            master,
+            service,
+            first_appointment,
+            _hold,
+            booking,
+        ) = await _create_confirmed_appointment(
+            session,
+            settings=settings,
+            now=created_at,
+            booking_date=first_date,
+        )
+        assert master.user_id is not None
+        schedule = MasterScheduleService()
+        await schedule.change_appointment_status(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=first_appointment.id,
+            actor_user_id=master.user_id,
+            new_status=AppointmentStatus.COMPLETED.value,
+            now=first_appointment.service_ends_at + timedelta(minutes=1),
+        )
+
+        manual_appointments: list[Appointment] = []
+        for index, manual_date in enumerate((second_date, third_date), 1):
+            selected = (
+                await AvailabilityService(settings).list_slots(
+                    session,
+                    business_id=business.id,
+                    master_id=master.id,
+                    service_id=service.id,
+                    local_date=manual_date,
+                    now=created_at,
+                )
+            )[0]
+            hold = await booking.create_hold(
+                session,
+                business_id=business.id,
+                master_id=master.id,
+                service_id=service.id,
+                client_id=master.user_id,
+                service_start=selected.service_start,
+                local_date=manual_date,
+                now=created_at,
+            )
+            summary = await booking.confirm_manual_hold(
+                session,
+                business_id=business.id,
+                hold_id=hold.id,
+                holder_user_id=master.user_id,
+                actor_user_id=master.user_id,
+                client_name=f"Ручной клиент {index}",
+                client_phone=f"+7999000000{index}",
+                now=created_at,
+            )
+            appointment = await session.get(Appointment, summary.appointment_id)
+            assert appointment is not None
+            manual_appointments.append(appointment)
+
+        await schedule.change_appointment_status(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=manual_appointments[1].id,
+            actor_user_id=master.user_id,
+            new_status=AppointmentStatus.CANCELLED_BY_MASTER.value,
+            now=created_at,
+        )
+        period = build_analytics_period(
+            mode="current_month",
+            timezone=ZoneInfo("Europe/Moscow"),
+            now=datetime(2026, 8, 20, 12, tzinfo=UTC),
+        )
+        report = await MasterAnalyticsService().build_report(
+            session,
+            business_id=business.id,
+            master=master,
+            period=period,
+        )
+        assert report.total_bookings == 3
+        assert report.active_bookings == 1
+        assert report.completed_bookings == 1
+        assert report.cancelled_by_master == 1
+        assert report.cancelled_by_client == 0
+        assert report.no_shows == 0
+        assert report.distinct_clients == 3
+        assert report.manual_bookings == 2
+        assert report.completed_revenue_minor == 200_000
+        assert report.active_value_minor == 200_000
+        assert report.average_completed_price_minor == 200_000
+        assert report.popular_services[0].name == "Консультация"
+        assert report.popular_services[0].booking_count == 2
+        await session.rollback()
+
+
+@pytest.mark.integration
+async def test_master_can_change_appointment_duration_and_internal_note() -> None:
+    settings = Settings()
+    now = datetime(2026, 7, 20, 6, tzinfo=UTC)
+    booking_date = date(2026, 8, 3)
+    async with async_session_factory() as session:
+        (
+            business,
+            _client,
+            master,
+            _service,
+            appointment,
+            _hold,
+            _booking,
+        ) = await _create_confirmed_appointment(
+            session,
+            settings=settings,
+            now=now,
+            booking_date=booking_date,
+        )
+        assert master.user_id is not None
+        schedule = MasterScheduleService()
+        changed = await schedule.change_appointment_duration(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=appointment.id,
+            actor_user_id=master.user_id,
+            duration_minutes=90,
+        )
+        assert changed.duration_minutes == 90
+        assert changed.local_end - changed.local_start == timedelta(minutes=90)
+
+        noted = await schedule.set_internal_note(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=appointment.id,
+            actor_user_id=master.user_id,
+            note="Подготовить индивидуальный эскиз",
+        )
+        assert noted.internal_note == "Подготовить индивидуальный эскиз"
+        event_types = set(
+            (
+                await session.scalars(
+                    select(AppointmentHistory.event_type).where(
+                        AppointmentHistory.appointment_id == appointment.id
+                    )
+                )
+            ).all()
+        )
+        assert "duration_changed_by_master" in event_types
+        assert "internal_note_changed_by_master" in event_types
+        await session.rollback()
+
+
+@pytest.mark.integration
+async def test_master_reschedule_notifies_client_and_reminder_settings_are_rebuilt() -> None:
+    settings = Settings()
+    now = datetime(2026, 7, 20, 6, tzinfo=UTC)
+    booking_date = date(2026, 8, 3)
+    new_date = date(2026, 8, 10)
+    async with async_session_factory() as session:
+        (
+            business,
+            client,
+            master,
+            service,
+            appointment,
+            _old_hold,
+            booking,
+        ) = await _create_confirmed_appointment(
+            session,
+            settings=settings,
+            now=now,
+            booking_date=booking_date,
+        )
+        assert master.user_id is not None
+        await MasterScheduleService().change_appointment_duration(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=appointment.id,
+            actor_user_id=master.user_id,
+            duration_minutes=90,
+        )
+        selected = (
+            await AvailabilityService(settings).list_slots(
+                session,
+                business_id=business.id,
+                master_id=master.id,
+                service_id=service.id,
+                local_date=new_date,
+                now=now,
+                duration_minutes_override=90,
+            )
+        )[0]
+        hold = await booking.create_hold(
+            session,
+            business_id=business.id,
+            master_id=master.id,
+            service_id=service.id,
+            client_id=master.user_id,
+            service_start=selected.service_start,
+            local_date=new_date,
+            now=now,
+            duration_minutes_override=90,
+        )
+        summary = await booking.confirm_master_reschedule(
+            session,
+            business_id=business.id,
+            master=master,
+            appointment_id=appointment.id,
+            hold_id=hold.id,
+            holder_user_id=master.user_id,
+            now=now,
+        )
+        assert summary.local_start.date() == new_date
+        assert summary.local_end - summary.local_start == timedelta(minutes=90)
+        assert appointment.client_id == client.id
+        assert await session.scalar(
+            select(NotificationJob.id).where(
+                NotificationJob.appointment_id == appointment.id,
+                NotificationJob.kind == "client_appointment_rescheduled",
+                NotificationJob.state == NotificationJobState.PENDING.value,
+            )
+        )
+
+        await update_client_reminder_settings(
+            session,
+            business_id=business.id,
+            master_user_id=master.user_id,
+            toggle="7d",
+        )
+        await booking.rebuild_client_reminders_for_master(
+            session,
+            business_id=business.id,
+            master=master,
+            now=now,
+        )
+        pending_reminder_kinds = set(
+            (
+                await session.scalars(
+                    select(NotificationJob.kind).where(
+                        NotificationJob.appointment_id == appointment.id,
+                        NotificationJob.kind.startswith("client_reminder_"),
+                        NotificationJob.state == NotificationJobState.PENDING.value,
+                    )
+                )
+            ).all()
+        )
+        assert "client_reminder_7d" not in pending_reminder_kinds
+        assert {
+            "client_reminder_3d",
+            "client_reminder_day_of",
+        }.issubset(pending_reminder_kinds)
+        await session.rollback()
+
+
+@pytest.mark.integration
+async def test_phone_client_is_merged_with_telegram_profile() -> None:
+    async with async_session_factory() as session:
+        suffix = uuid4().hex[:12]
+        business = Business(slug=f"merge-{suffix}", name="Merge Test")
+        master_user = TelegramUser(telegram_user_id=-(uuid4().int % 2_000_000_000))
+        telegram_client = TelegramUser(
+            telegram_user_id=-(uuid4().int % 2_000_000_000),
+            first_name="Мария",
+        )
+        manual_client = TelegramUser(
+            telegram_user_id=None,
+            first_name="Мария",
+            phone="+79991112233",
+        )
+        session.add_all([business, master_user, telegram_client, manual_client])
+        await session.flush()
+        master = Master(
+            business_id=business.id,
+            user_id=master_user.id,
+            display_name="Анна",
+        )
+        service = Service(
+            business_id=business.id,
+            name="Консультация",
+            duration_minutes=60,
+        )
+        session.add_all([master, service])
+        await session.flush()
+        starts_at = datetime(2026, 8, 20, 7, tzinfo=UTC)
+        entry = CalendarEntry(
+            business_id=business.id,
+            master_id=master.id,
+            starts_at=starts_at,
+            ends_at=starts_at + timedelta(hours=1),
+            kind=CalendarEntryKind.APPOINTMENT.value,
+            state=CalendarEntryState.ACTIVE.value,
+        )
+        session.add(entry)
+        await session.flush()
+        appointment = Appointment(
+            business_id=business.id,
+            calendar_entry_id=entry.id,
+            service_id=service.id,
+            client_id=manual_client.id,
+            status=AppointmentStatus.CONFIRMED.value,
+            service_name_snapshot=service.name,
+            service_starts_at=starts_at,
+            service_ends_at=starts_at + timedelta(hours=1),
+            duration_minutes=60,
+            client_name_snapshot="Мария",
+            client_phone_snapshot="+79991112233",
+        )
+        session.add(appointment)
+        await session.flush()
+        manual_client_id = manual_client.id
+
+        merged_ids = await set_user_phone(
+            session,
+            telegram_client,
+            "8 (999) 111-22-33",
+        )
+        assert merged_ids == [appointment.id]
+        assert appointment.client_id == telegram_client.id
+        assert telegram_client.phone == "+79991112233"
+        assert await session.get(TelegramUser, manual_client_id) is None
         await session.rollback()

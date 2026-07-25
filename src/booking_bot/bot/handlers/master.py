@@ -8,25 +8,62 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from booking_bot.bot.keyboards import (
+    dates_keyboard,
     main_menu_keyboard,
+    master_analytics_keyboard,
     master_appointment_actions_keyboard,
     master_appointments_keyboard,
     master_availability_keyboard,
     master_blocks_keyboard,
     master_days_off_keyboard,
+    master_manual_cancel_keyboard,
+    master_manual_comment_keyboard,
+    master_manual_confirmation_keyboard,
+    master_manual_dates_keyboard,
+    master_manual_services_keyboard,
+    master_manual_slots_keyboard,
     master_menu_keyboard,
     master_notifications_keyboard,
+    master_reschedule_confirmation_keyboard,
+    master_schedule_dates_keyboard,
     master_service_actions_keyboard,
     master_service_cancel_keyboard,
     master_services_keyboard,
     master_weekdays_keyboard,
+    slots_keyboard,
 )
 from booking_bot.bot.states import MasterStates
-from booking_bot.db.models import Business, Master, Service, TelegramUser
+from booking_bot.config import get_settings
+from booking_bot.db.models import (
+    Appointment,
+    Business,
+    CalendarEntry,
+    Master,
+    Service,
+    TelegramUser,
+)
 from booking_bot.domain.enums import AppointmentStatus
+from booking_bot.services.analytics import (
+    MasterAnalytics,
+    MasterAnalyticsService,
+    build_analytics_period,
+)
+from booking_bot.services.availability import AvailabilityService, BookingConfigurationError
+from booking_bot.services.bookings import (
+    AppointmentChangeNotAllowedError,
+    BookingService,
+    HoldExpiredError,
+    HoldNotFoundError,
+    ManualClientValidationError,
+    SlotUnavailableError,
+)
+from booking_bot.services.bookings import (
+    AppointmentNotFoundError as ClientAppointmentNotFoundError,
+)
 from booking_bot.services.master_access import get_master_for_user
 from booking_bot.services.master_schedule import (
     AppointmentNotFoundError,
@@ -39,6 +76,10 @@ from booking_bot.services.notification_delivery import (
     master_notifications_enabled,
     toggle_master_notifications,
 )
+from booking_bot.services.reminder_settings import (
+    get_client_reminder_settings,
+    update_client_reminder_settings,
+)
 from booking_bot.services.service_catalog import (
     MAX_BUFFER_MINUTES,
     MAX_DURATION_MINUTES,
@@ -49,11 +90,14 @@ from booking_bot.services.service_catalog import (
     ServiceNotFoundError,
     SpecialistServiceCatalog,
 )
-from booking_bot.services.users import get_or_create_telegram_user
+from booking_bot.services.users import get_or_create_telegram_user, normalize_phone
 
 router = Router(name="master")
 schedule_service = MasterScheduleService()
 service_catalog = SpecialistServiceCatalog()
+manual_booking_service = BookingService(get_settings())
+availability_service = AvailabilityService(get_settings())
+analytics_service = MasterAnalyticsService()
 
 STATUS_LABELS = {
     AppointmentStatus.PENDING_APPROVAL.value: "ожидает подтверждения",
@@ -114,13 +158,20 @@ def _format_appointment(item: MasterAppointment) -> str:
     client_name = escape(item.client_name or "Клиент")
     phone = escape(item.client_phone or "не указан")
     location = f"\nМесто: <b>{escape(item.location_name)}</b>" if item.location_name else ""
+    comment = f"\nКомментарий: {escape(item.client_comment)}" if item.client_comment else ""
+    internal_note = (
+        f"\nВнутренняя заметка: <i>{escape(item.internal_note)}</i>"
+        if item.internal_note
+        else "\nВнутренняя заметка: нет"
+    )
     return (
         f"<b>{item.local_start:%d.%m.%Y %H:%M}-{item.local_end:%H:%M}</b>\n"
         f"Услуга: <b>{escape(item.service_name)}</b>\n"
+        f"Длительность: <b>{item.duration_minutes} мин.</b>\n"
         f"Клиент: <b>{client_name}</b>\n"
         f"Телефон: <code>{phone}</code>\n"
         f"Статус: <b>{STATUS_LABELS.get(item.status, escape(item.status))}</b>"
-        f"{location}"
+        f"{location}{comment}{internal_note}"
     )
 
 
@@ -133,6 +184,61 @@ def _format_price(service: Service) -> str:
         amount = f"{amount},{cents:02d}"
     symbols = {"RUB": "₽", "USD": "$", "EUR": "€"}
     return f"{amount} {symbols.get(service.currency, service.currency)}"
+
+
+def _format_money_minor(value: int | None, currency: str) -> str:
+    if value is None:
+        return "нет данных"
+    whole, cents = divmod(value, 100)
+    amount = f"{whole:,}".replace(",", " ")
+    if cents:
+        amount = f"{amount},{cents:02d}"
+    symbols = {"RUB": "₽", "USD": "$", "EUR": "€"}
+    return f"{amount} {symbols.get(currency, currency)}"
+
+
+def _format_analytics(report: MasterAnalytics) -> str:
+    cancellations = report.cancelled_by_client + report.cancelled_by_master
+    cancellation_rate = cancellations / report.total_bookings * 100 if report.total_bookings else 0
+    no_show_rate = report.no_shows / report.total_bookings * 100 if report.total_bookings else 0
+    popular = (
+        "\n".join(
+            f"{index}. {escape(item.name)} — <b>{item.booking_count}</b>"
+            for index, item in enumerate(report.popular_services, 1)
+        )
+        if report.popular_services
+        else "Пока нет данных"
+    )
+    completed_value = _format_money_minor(
+        report.completed_revenue_minor,
+        report.currency,
+    )
+    average_value = _format_money_minor(
+        report.average_completed_price_minor,
+        report.currency,
+    )
+    active_value = _format_money_minor(report.active_value_minor, report.currency)
+    return (
+        "📊 <b>Статистика</b>\n"
+        f"Период: <b>{report.period.label}</b>\n\n"
+        f"Всего записей: <b>{report.total_bookings}</b>\n"
+        f"Активные: <b>{report.active_bookings}</b>\n"
+        f"Выполнены: <b>{report.completed_bookings}</b>\n"
+        f"Отменены клиентами: <b>{report.cancelled_by_client}</b>\n"
+        f"Отменены специалистом: <b>{report.cancelled_by_master}</b>\n"
+        f"Неявки: <b>{report.no_shows}</b>\n"
+        f"Доля отмен: <b>{cancellation_rate:.1f}%</b>\n"
+        f"Доля неявок: <b>{no_show_rate:.1f}%</b>\n\n"
+        f"Клиентов: <b>{report.distinct_clients}</b>\n"
+        f"Ручных записей: <b>{report.manual_bookings}</b>\n\n"
+        "<b>Стоимость записей</b>\n"
+        f"Выполненные: <b>{completed_value}</b>\n"
+        f"Средняя выполненная: <b>{average_value}</b>\n"
+        f"Активные: <b>{active_value}</b>\n\n"
+        "<b>Популярные услуги</b>\n"
+        f"{popular}\n\n"
+        "<i>Суммы рассчитаны по ценам записей и пока не подтверждают фактическую оплату.</i>"
+    )
 
 
 def _format_service(service: Service) -> str:
@@ -209,6 +315,102 @@ async def _deny(callback: CallbackQuery) -> None:
     await callback.answer("Кабинет доступен только владельцу бота", show_alert=True)
 
 
+async def _release_manual_hold(state: FSMContext, session: AsyncSession) -> None:
+    data = await state.get_data()
+    try:
+        hold_id = UUID(data["hold_id"])
+        holder_user_id = UUID(data["client_id"])
+    except (KeyError, ValueError):
+        return
+    await manual_booking_service.release_hold(
+        session,
+        hold_id=hold_id,
+        client_id=holder_user_id,
+    )
+
+
+async def _show_manual_dates(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    business_id: UUID,
+    master: Master,
+) -> None:
+    timezone = await _master_timezone(session, business_id, master)
+    today = datetime.now(UTC).astimezone(timezone).date()
+    dates = [today + timedelta(days=offset) for offset in range(get_settings().booking_dates_shown)]
+    await state.set_state(MasterStates.manual_selecting_date)
+    await _edit(
+        callback,
+        "Выберите дату ручной записи:",
+        reply_markup=master_manual_dates_keyboard(dates),
+    )
+    await callback.answer()
+
+
+async def _show_master_reschedule_dates(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    business_id: UUID,
+    master: Master,
+) -> None:
+    data = await state.get_data()
+    try:
+        appointment_id = UUID(data["appointment_id"])
+    except (KeyError, ValueError):
+        await state.clear()
+        await callback.answer("Начните перенос заново", show_alert=True)
+        return
+    timezone = await _master_timezone(session, business_id, master)
+    today = datetime.now(UTC).astimezone(timezone).date()
+    dates = [
+        today + timedelta(days=offset)
+        for offset in range(get_settings().booking_dates_shown)
+    ]
+    await state.set_state(MasterStates.rescheduling_date)
+    await _edit(
+        callback,
+        "Выберите новую дату записи:",
+        reply_markup=dates_keyboard(
+            dates,
+            callback_prefix="mrd",
+            back_callback=f"master:appointment:{appointment_id}",
+            back_text="Назад к записи",
+        ),
+    )
+    await callback.answer()
+
+
+def _normalize_phone(raw_phone: str) -> str | None:
+    return normalize_phone(raw_phone)
+
+
+def _format_manual_confirmation(
+    *,
+    service_name: str,
+    local_start: datetime,
+    local_end: datetime,
+    location_name: str | None,
+    client_name: str,
+    client_phone: str,
+    client_comment: str | None,
+) -> str:
+    location = f"\nМесто: <b>{escape(location_name)}</b>" if location_name else ""
+    comment = f"\nКомментарий: {escape(client_comment)}" if client_comment else "\nКомментарий: нет"
+    return (
+        "<b>Проверьте ручную запись</b>\n\n"
+        f"Услуга: <b>{escape(service_name)}</b>\n"
+        f"Дата: <b>{local_start:%d.%m.%Y}</b>\n"
+        f"Время: <b>{local_start:%H:%M}-{local_end:%H:%M}</b>"
+        f"{location}\n"
+        f"Клиент: <b>{escape(client_name)}</b>\n"
+        f"Телефон: <code>{escape(client_phone)}</code>"
+        f"{comment}\n\n"
+        "Клиент добавлен вручную, поэтому Telegram-напоминания ему не отправляются."
+    )
+
+
 @router.callback_query(F.data == "master:menu")
 async def master_menu(
     callback: CallbackQuery,
@@ -221,6 +423,7 @@ async def master_menu(
         await _deny(callback)
         return
     _user, master = context
+    await _release_manual_hold(state, db_session)
     await state.clear()
     await _edit(
         callback,
@@ -620,7 +823,442 @@ async def master_toggle_service_setting(
     await callback.answer(result_text)
 
 
-@router.callback_query(F.data.startswith("master:schedule:"))
+@router.callback_query(F.data == "mb:start")
+async def master_manual_booking_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    await _release_manual_hold(state, db_session)
+    await state.clear()
+    services = [
+        service
+        for service in await service_catalog.list_services(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+        )
+        if service.is_active
+    ]
+    if not services:
+        await callback.answer("Сначала опубликуйте хотя бы одну услугу", show_alert=True)
+        return
+    await state.set_state(MasterStates.manual_selecting_service)
+    await _edit(
+        callback,
+        "<b>Новая ручная запись</b>\n\nВыберите услугу:",
+        reply_markup=master_manual_services_keyboard(services),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("master:analytics:"))
+async def master_analytics(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    mode = (callback.data or "").rsplit(":", 1)[-1]
+    try:
+        timezone = await _master_timezone(db_session, business_id, master)
+        period = build_analytics_period(mode=mode, timezone=timezone)
+        report = await analytics_service.build_report(
+            db_session,
+            business_id=business_id,
+            master=master,
+            period=period,
+        )
+    except ValueError:
+        await callback.answer("Неизвестный период", show_alert=True)
+        return
+    await _release_manual_hold(state, db_session)
+    await state.clear()
+    await _edit(
+        callback,
+        _format_analytics(report),
+        reply_markup=master_analytics_keyboard(mode),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    MasterStates.manual_selecting_service,
+    F.data.startswith("mb:s:"),
+)
+async def master_manual_select_service(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    user, master = context
+    try:
+        service_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+        service = await service_catalog.get_service(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+        )
+    except (ValueError, ServiceNotFoundError):
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    if not service.is_active:
+        await callback.answer("Эта услуга сейчас скрыта", show_alert=True)
+        return
+    await state.update_data(
+        service_id=str(service.id),
+        master_id=str(master.id),
+        actor_user_id=str(user.id),
+    )
+    await _show_manual_dates(callback, state, db_session, business_id, master)
+
+
+@router.callback_query(F.data == "mb:dates")
+async def master_manual_back_to_dates(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    await _show_manual_dates(callback, state, db_session, business_id, master)
+
+
+@router.callback_query(
+    MasterStates.manual_selecting_date,
+    F.data.startswith("mb:d:"),
+)
+async def master_manual_select_date(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        local_date = date.fromisoformat((callback.data or "").rsplit(":", 1)[-1])
+        service_id = UUID((await state.get_data())["service_id"])
+        slots = await availability_service.list_slots(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+            local_date=local_date,
+            respect_min_lead_time=False,
+        )
+    except (KeyError, ValueError):
+        await callback.answer("Начните создание записи заново", show_alert=True)
+        return
+    except BookingConfigurationError:
+        await callback.answer("Услуга или расписание сейчас недоступны", show_alert=True)
+        return
+    timezone = await _master_timezone(db_session, business_id, master)
+    await state.update_data(local_date=local_date.isoformat())
+    if not slots:
+        await _edit(
+            callback,
+            f"На {local_date:%d.%m.%Y} свободных окон нет. Выберите другую дату:",
+            reply_markup=master_manual_dates_keyboard(
+                [
+                    datetime.now(UTC).astimezone(timezone).date() + timedelta(days=offset)
+                    for offset in range(get_settings().booking_dates_shown)
+                ]
+            ),
+        )
+    else:
+        await state.set_state(MasterStates.manual_selecting_slot)
+        await _edit(
+            callback,
+            f"Свободное время на {local_date:%d.%m.%Y}:",
+            reply_markup=master_manual_slots_keyboard(slots, timezone),
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    MasterStates.manual_selecting_slot,
+    F.data.startswith("mb:t:"),
+)
+async def master_manual_select_slot(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    user, master = context
+    try:
+        data = await state.get_data()
+        service_start = datetime.fromtimestamp(
+            int((callback.data or "").rsplit(":", 1)[-1]),
+            tz=UTC,
+        )
+        service_id = UUID(data["service_id"])
+        local_date = date.fromisoformat(data["local_date"])
+    except (KeyError, TypeError, ValueError):
+        await callback.answer("Начните создание записи заново", show_alert=True)
+        return
+    try:
+        hold = await manual_booking_service.create_hold(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+            client_id=user.id,
+            service_start=service_start,
+            local_date=local_date,
+            respect_min_lead_time=False,
+        )
+    except SlotUnavailableError:
+        await callback.answer("Это время уже занято. Выберите другое.", show_alert=True)
+        return
+    await state.update_data(hold_id=str(hold.id), client_id=str(user.id))
+    await state.set_state(MasterStates.manual_waiting_name)
+    await _edit(
+        callback,
+        "Время удерживается 10 минут.\n\nОтправьте имя клиента:",
+        reply_markup=master_manual_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(MasterStates.manual_waiting_name, F.text)
+async def master_manual_receive_name(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if await _master_for_actor(message.from_user, db_session, business_id) is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return
+    client_name = " ".join((message.text or "").split())
+    if not 2 <= len(client_name) <= 160:
+        await message.answer("Имя должно содержать от 2 до 160 символов.")
+        return
+    await state.update_data(client_name=client_name)
+    await state.set_state(MasterStates.manual_waiting_phone)
+    await message.answer(
+        "Отправьте телефон клиента:",
+        reply_markup=master_manual_cancel_keyboard(),
+    )
+
+
+@router.message(MasterStates.manual_waiting_phone, F.text)
+async def master_manual_receive_phone(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if await _master_for_actor(message.from_user, db_session, business_id) is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return
+    client_phone = _normalize_phone(message.text or "")
+    if client_phone is None:
+        await message.answer("Введите телефон из 10-15 цифр.")
+        return
+    await state.update_data(client_phone=client_phone)
+    await state.set_state(MasterStates.manual_waiting_comment)
+    await message.answer(
+        "Отправьте комментарий к записи или нажмите «Без комментария»:",
+        reply_markup=master_manual_comment_keyboard(),
+    )
+
+
+async def _manual_confirmation_from_state(
+    state: FSMContext,
+    session: AsyncSession,
+) -> tuple[str, dict]:
+    data = await state.get_data()
+    hold_summary = await manual_booking_service.get_hold_summary(
+        session,
+        hold_id=UUID(data["hold_id"]),
+        client_id=UUID(data["client_id"]),
+    )
+    text = _format_manual_confirmation(
+        service_name=hold_summary.service_name,
+        local_start=hold_summary.local_start,
+        local_end=hold_summary.local_end,
+        location_name=hold_summary.location_name,
+        client_name=data["client_name"],
+        client_phone=data["client_phone"],
+        client_comment=data.get("client_comment"),
+    )
+    return text, data
+
+
+@router.message(MasterStates.manual_waiting_comment, F.text)
+async def master_manual_receive_comment(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if await _master_for_actor(message.from_user, db_session, business_id) is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return
+    comment = (message.text or "").strip()
+    if len(comment) > 2000:
+        await message.answer("Комментарий должен быть не длиннее 2000 символов.")
+        return
+    await state.update_data(client_comment=comment or None)
+    try:
+        text, _data = await _manual_confirmation_from_state(state, db_session)
+    except (KeyError, ValueError, HoldNotFoundError):
+        await state.clear()
+        await message.answer("Время больше не удерживается. Создайте запись заново.")
+        return
+    await state.set_state(MasterStates.manual_confirming)
+    await message.answer(text, reply_markup=master_manual_confirmation_keyboard())
+
+
+@router.callback_query(
+    MasterStates.manual_waiting_comment,
+    F.data == "mb:comment:skip",
+)
+async def master_manual_skip_comment(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if await _master_for_actor(callback.from_user, db_session, business_id) is None:
+        await _deny(callback)
+        return
+    await state.update_data(client_comment=None)
+    try:
+        text, _data = await _manual_confirmation_from_state(state, db_session)
+    except (KeyError, ValueError, HoldNotFoundError):
+        await state.clear()
+        await callback.answer("Время больше не удерживается", show_alert=True)
+        return
+    await state.set_state(MasterStates.manual_confirming)
+    await _edit(
+        callback,
+        text,
+        reply_markup=master_manual_confirmation_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    MasterStates.manual_confirming,
+    F.data == "mb:confirm",
+)
+async def master_manual_confirm(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    user, master = context
+    data = await state.get_data()
+    try:
+        summary = await manual_booking_service.confirm_manual_hold(
+            db_session,
+            business_id=business_id,
+            hold_id=UUID(data["hold_id"]),
+            holder_user_id=UUID(data["client_id"]),
+            actor_user_id=user.id,
+            client_name=data["client_name"],
+            client_phone=data["client_phone"],
+            client_comment=data.get("client_comment"),
+        )
+        appointment = await schedule_service.get_appointment(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=summary.appointment_id,
+        )
+    except (KeyError, ValueError, HoldNotFoundError, ManualClientValidationError):
+        await state.clear()
+        await callback.answer("Не удалось создать запись", show_alert=True)
+        return
+    except HoldExpiredError:
+        await state.clear()
+        await _edit(
+            callback,
+            "Время удержания истекло. Создайте запись заново.",
+            reply_markup=master_menu_keyboard(),
+        )
+        await callback.answer()
+        return
+    await state.clear()
+    await _edit(
+        callback,
+        "✅ <b>Запись создана вручную</b>\n\n" + _format_appointment(appointment),
+        reply_markup=master_appointment_actions_keyboard(appointment),
+    )
+    await callback.answer("Запись добавлена в расписание")
+
+
+@router.callback_query(F.data == "mb:abort")
+async def master_manual_abort(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    await _release_manual_hold(state, db_session)
+    await state.clear()
+    await _edit(
+        callback,
+        f"Мой кабинет — <b>{escape(master.display_name)}</b>:",
+        reply_markup=master_menu_keyboard(),
+    )
+    await callback.answer("Создание записи отменено")
+
+
+@router.callback_query(
+    F.data.in_(
+        {
+            "master:schedule:today",
+            "master:schedule:tomorrow",
+            "master:schedule:week",
+        }
+    )
+)
 async def master_schedule(
     callback: CallbackQuery,
     db_session: AsyncSession,
@@ -664,6 +1302,67 @@ async def master_schedule(
     await callback.answer()
 
 
+@router.callback_query(F.data == "master:schedule:choose")
+async def master_choose_schedule_date(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    timezone = await _master_timezone(db_session, business_id, master)
+    today = datetime.now(UTC).astimezone(timezone).date()
+    dates = [today + timedelta(days=offset) for offset in range(60)]
+    await _edit(
+        callback,
+        "<b>Расписание на дату</b>\n\nВыберите день:",
+        reply_markup=master_schedule_dates_keyboard(dates),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("master:schedule:date:"))
+async def master_schedule_selected_date(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        selected_date = date.fromisoformat((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("Некорректная дата", show_alert=True)
+        return
+    appointments = await schedule_service.list_appointments(
+        db_session,
+        business_id=business_id,
+        master=master,
+        start_date=selected_date,
+        days=1,
+    )
+    text = (
+        f"<b>Расписание на {selected_date:%d.%m.%Y}</b>\n\n"
+        + (
+            "Выберите запись для просмотра."
+            if appointments
+            else "Записей нет."
+        )
+    )
+    await _edit(
+        callback,
+        text,
+        reply_markup=master_appointments_keyboard(appointments),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("master:appointment:"))
 async def master_appointment(
     callback: CallbackQuery,
@@ -692,6 +1391,438 @@ async def master_appointment(
         reply_markup=master_appointment_actions_keyboard(appointment),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("master:duration:"))
+async def master_change_duration(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        appointment_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+        appointment = await schedule_service.get_appointment(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=appointment_id,
+        )
+    except (ValueError, AppointmentNotFoundError):
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    await state.set_state(MasterStates.waiting_appointment_duration)
+    await state.update_data(appointment_id=str(appointment_id))
+    await _edit(
+        callback,
+        f"Текущая длительность: <b>{appointment.duration_minutes} мин.</b>\n\n"
+        "Отправьте новую длительность в минутах (от 5 до 1440).",
+    )
+    await callback.answer()
+
+
+@router.message(MasterStates.waiting_appointment_duration, F.text)
+async def master_receive_duration(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(message.from_user, db_session, business_id)
+    if context is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return
+    user, master = context
+    data = await state.get_data()
+    try:
+        duration_minutes = int((message.text or "").strip())
+        appointment = await schedule_service.change_appointment_duration(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=UUID(data["appointment_id"]),
+            actor_user_id=user.id,
+            duration_minutes=duration_minutes,
+        )
+    except (KeyError, ValueError):
+        await message.answer("Введите целое число от 5 до 1440.")
+        return
+    except AppointmentNotFoundError:
+        await state.clear()
+        await message.answer("Запись не найдена.", reply_markup=master_menu_keyboard())
+        return
+    except ScheduleConflictError:
+        await message.answer(
+            "Новая длительность пересекается с другой записью или блокировкой. "
+            "Укажите меньшее значение."
+        )
+        return
+    await state.clear()
+    await message.answer(
+        "Длительность изменена.\n\n" + _format_appointment(appointment),
+        reply_markup=master_appointment_actions_keyboard(appointment),
+    )
+
+
+@router.callback_query(F.data.startswith("master:note:"))
+async def master_edit_internal_note(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        appointment_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+        appointment = await schedule_service.get_appointment(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=appointment_id,
+        )
+    except (ValueError, AppointmentNotFoundError):
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    current = escape(appointment.internal_note) if appointment.internal_note else "нет"
+    await state.set_state(MasterStates.waiting_internal_note)
+    await state.update_data(appointment_id=str(appointment_id))
+    await _edit(
+        callback,
+        f"Текущая внутренняя заметка: <i>{current}</i>\n\n"
+        "Отправьте новый текст. Чтобы удалить заметку, отправьте один символ <code>-</code>.\n"
+        "Клиент эту заметку не увидит.",
+    )
+    await callback.answer()
+
+
+@router.message(MasterStates.waiting_internal_note, F.text)
+async def master_receive_internal_note(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(message.from_user, db_session, business_id)
+    if context is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return
+    user, master = context
+    data = await state.get_data()
+    note = None if (message.text or "").strip() == "-" else message.text
+    try:
+        appointment = await schedule_service.set_internal_note(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=UUID(data["appointment_id"]),
+            actor_user_id=user.id,
+            note=note,
+        )
+    except KeyError:
+        await state.clear()
+        await message.answer("Запись не найдена.", reply_markup=master_menu_keyboard())
+        return
+    except ValueError:
+        await message.answer("Заметка должна быть не длиннее 4000 символов.")
+        return
+    except AppointmentNotFoundError:
+        await state.clear()
+        await message.answer("Запись не найдена.", reply_markup=master_menu_keyboard())
+        return
+    await state.clear()
+    await message.answer(
+        "Внутренняя заметка сохранена.\n\n" + _format_appointment(appointment),
+        reply_markup=master_appointment_actions_keyboard(appointment),
+    )
+
+
+@router.callback_query(F.data.startswith("master:move-start:"))
+async def master_start_reschedule(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    user, master = context
+    try:
+        appointment_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    appointment = await db_session.scalar(
+        select(Appointment)
+        .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+        .where(
+            Appointment.id == appointment_id,
+            Appointment.business_id == business_id,
+            CalendarEntry.master_id == master.id,
+            Appointment.status.in_(
+                [
+                    AppointmentStatus.PENDING_APPROVAL.value,
+                    AppointmentStatus.CONFIRMED.value,
+                ]
+            ),
+        )
+    )
+    if (
+        appointment is None
+        or appointment.service_id is None
+        or appointment.service_starts_at <= datetime.now(UTC)
+    ):
+        await callback.answer("Эту запись уже нельзя перенести", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        appointment_id=str(appointment.id),
+        service_id=str(appointment.service_id),
+        duration_minutes=appointment.duration_minutes,
+        master_id=str(master.id),
+        holder_user_id=str(user.id),
+    )
+    await _show_master_reschedule_dates(
+        callback,
+        state,
+        db_session,
+        business_id,
+        master,
+    )
+
+
+@router.callback_query(F.data == "master:move:dates")
+async def master_back_to_reschedule_dates(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    await _show_master_reschedule_dates(
+        callback,
+        state,
+        db_session,
+        business_id,
+        master,
+    )
+
+
+@router.callback_query(MasterStates.rescheduling_date, F.data.startswith("mrd:"))
+async def master_select_reschedule_date(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        local_date = date.fromisoformat((callback.data or "").split(":", 1)[1])
+        data = await state.get_data()
+        service_id = UUID(data["service_id"])
+        duration_minutes = int(data["duration_minutes"])
+    except (KeyError, ValueError):
+        await callback.answer("Начните перенос заново", show_alert=True)
+        return
+    try:
+        slots = await availability_service.list_slots(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+            local_date=local_date,
+            duration_minutes_override=duration_minutes,
+        )
+    except BookingConfigurationError:
+        await callback.answer("Услуга или расписание больше недоступны", show_alert=True)
+        return
+    timezone = await _master_timezone(db_session, business_id, master)
+    await state.update_data(local_date=local_date.isoformat())
+    if not slots:
+        await callback.answer("На эту дату свободных окон нет", show_alert=True)
+        return
+    await state.set_state(MasterStates.rescheduling_slot)
+    await _edit(
+        callback,
+        f"Свободное время на {local_date:%d.%m.%Y}:",
+        reply_markup=slots_keyboard(
+            slots,
+            timezone,
+            callback_prefix="mrs",
+            back_callback="master:move:dates",
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(MasterStates.rescheduling_slot, F.data.startswith("mrs:"))
+async def master_select_reschedule_slot(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    data = await state.get_data()
+    try:
+        service_start = datetime.fromtimestamp(
+            int((callback.data or "").split(":", 1)[1]),
+            tz=UTC,
+        )
+        service_id = UUID(data["service_id"])
+        holder_user_id = UUID(data["holder_user_id"])
+        local_date = date.fromisoformat(data["local_date"])
+        duration_minutes = int(data["duration_minutes"])
+    except (KeyError, TypeError, ValueError):
+        await callback.answer("Начните перенос заново", show_alert=True)
+        return
+    try:
+        hold = await manual_booking_service.create_hold(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+            client_id=holder_user_id,
+            service_start=service_start,
+            local_date=local_date,
+            duration_minutes_override=duration_minutes,
+        )
+    except SlotUnavailableError:
+        await callback.answer("Это время уже занято", show_alert=True)
+        return
+    summary = await manual_booking_service.get_hold_summary(
+        db_session,
+        hold_id=hold.id,
+        client_id=holder_user_id,
+    )
+    await state.update_data(hold_id=str(hold.id))
+    await state.set_state(MasterStates.rescheduling_confirming)
+    await _edit(
+        callback,
+        "<b>Проверьте новое время</b>\n\n"
+        f"Услуга: <b>{escape(summary.service_name)}</b>\n"
+        f"Дата: <b>{summary.local_start:%d.%m.%Y}</b>\n"
+        f"Время: <b>{summary.local_start:%H:%M}-{summary.local_end:%H:%M}</b>\n\n"
+        "Старое время освободится только после подтверждения.",
+        reply_markup=master_reschedule_confirmation_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    MasterStates.rescheduling_confirming,
+    F.data == "master:move:confirm",
+)
+async def master_confirm_reschedule(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    user, master = context
+    data = await state.get_data()
+    try:
+        summary = await manual_booking_service.confirm_master_reschedule(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=UUID(data["appointment_id"]),
+            hold_id=UUID(data["hold_id"]),
+            holder_user_id=user.id,
+        )
+        appointment = await schedule_service.get_appointment(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=summary.appointment_id,
+        )
+    except (
+        KeyError,
+        ValueError,
+        HoldNotFoundError,
+        HoldExpiredError,
+        AppointmentChangeNotAllowedError,
+        ClientAppointmentNotFoundError,
+        AppointmentNotFoundError,
+    ):
+        await state.clear()
+        await callback.answer("Не удалось перенести запись", show_alert=True)
+        return
+    await state.clear()
+    await _edit(
+        callback,
+        "Запись перенесена. Клиент получит уведомление.\n\n"
+        + _format_appointment(appointment),
+        reply_markup=master_appointment_actions_keyboard(appointment),
+    )
+    await callback.answer("Новое время сохранено")
+
+
+@router.callback_query(F.data == "master:move:abort")
+async def master_abort_reschedule(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    user, master = context
+    data = await state.get_data()
+    if "hold_id" in data:
+        await manual_booking_service.release_hold(
+            db_session,
+            hold_id=UUID(data["hold_id"]),
+            client_id=user.id,
+        )
+    try:
+        appointment = await schedule_service.get_appointment(
+            db_session,
+            business_id=business_id,
+            master=master,
+            appointment_id=UUID(data["appointment_id"]),
+        )
+    except (KeyError, ValueError, AppointmentNotFoundError):
+        await state.clear()
+        await _edit(callback, "Прежнее время сохранено.", reply_markup=master_menu_keyboard())
+    else:
+        await state.clear()
+        await _edit(
+            callback,
+            "Прежнее время сохранено.\n\n" + _format_appointment(appointment),
+            reply_markup=master_appointment_actions_keyboard(appointment),
+        )
+    await callback.answer("Перенос отменён")
 
 
 @router.callback_query(F.data.startswith("master:status:"))
@@ -1108,16 +2239,23 @@ async def master_notifications(
     if context is None:
         await _deny(callback)
         return
-    user, _master = context
+    user, master = context
     enabled = await master_notifications_enabled(
         db_session,
         business_id=business_id,
         user_id=user.id,
     )
+    reminders = await get_client_reminder_settings(
+        db_session,
+        business_id=business_id,
+        master_user_id=user.id,
+    )
     await _edit(
         callback,
-        "<b>Уведомления специалиста</b>\n\nЗдесь можно отключить сообщения о новых записях.",
-        reply_markup=master_notifications_keyboard(enabled),
+        "<b>Уведомления</b>\n\n"
+        "Настройте сообщения специалисту и напоминания клиентам. "
+        "Изменения применяются и к будущим уже созданным записям.",
+        reply_markup=master_notifications_keyboard(enabled, reminders),
     )
     await callback.answer()
 
@@ -1138,9 +2276,118 @@ async def master_toggle_notifications(
         business_id=business_id,
         user_id=user.id,
     )
+    reminders = await get_client_reminder_settings(
+        db_session,
+        business_id=business_id,
+        master_user_id=user.id,
+    )
     await _edit(
         callback,
-        "<b>Уведомления специалиста</b>\n\nЗдесь можно отключить сообщения о новых записях.",
-        reply_markup=master_notifications_keyboard(enabled),
+        "<b>Уведомления</b>\n\n"
+        "Настройте сообщения специалисту и напоминания клиентам. "
+        "Изменения применяются и к будущим уже созданным записям.",
+        reply_markup=master_notifications_keyboard(enabled, reminders),
     )
     await callback.answer("Уведомления включены" if enabled else "Уведомления выключены")
+
+
+@router.callback_query(F.data.startswith("master:reminders:toggle:"))
+async def master_toggle_client_reminder(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    user, master = context
+    toggle = (callback.data or "").rsplit(":", 1)[-1]
+    try:
+        reminders = await update_client_reminder_settings(
+            db_session,
+            business_id=business_id,
+            master_user_id=user.id,
+            toggle=toggle,
+        )
+    except ValueError:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    await manual_booking_service.rebuild_client_reminders_for_master(
+        db_session,
+        business_id=business_id,
+        master=master,
+    )
+    enabled = await master_notifications_enabled(
+        db_session,
+        business_id=business_id,
+        user_id=user.id,
+    )
+    await _edit(
+        callback,
+        "<b>Уведомления</b>\n\n"
+        "Настройте сообщения специалисту и напоминания клиентам. "
+        "Изменения применяются и к будущим уже созданным записям.",
+        reply_markup=master_notifications_keyboard(enabled, reminders),
+    )
+    await callback.answer("Настройки напоминаний сохранены")
+
+
+@router.callback_query(F.data == "master:reminders:hour")
+async def master_set_reminder_hour(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if await _master_for_actor(callback.from_user, db_session, business_id) is None:
+        await _deny(callback)
+        return
+    await state.set_state(MasterStates.waiting_reminder_hour)
+    await _edit(
+        callback,
+        "Отправьте час утреннего напоминания клиенту — целое число от "
+        "<b>0</b> до <b>23</b>.\n\nНапример: <code>9</code>.",
+    )
+    await callback.answer()
+
+
+@router.message(MasterStates.waiting_reminder_hour, F.text)
+async def master_receive_reminder_hour(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(message.from_user, db_session, business_id)
+    if context is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return
+    user, master = context
+    try:
+        hour = int((message.text or "").strip())
+        reminders = await update_client_reminder_settings(
+            db_session,
+            business_id=business_id,
+            master_user_id=user.id,
+            day_of_hour=hour,
+        )
+    except ValueError:
+        await message.answer("Введите целое число от 0 до 23.")
+        return
+    await manual_booking_service.rebuild_client_reminders_for_master(
+        db_session,
+        business_id=business_id,
+        master=master,
+    )
+    enabled = await master_notifications_enabled(
+        db_session,
+        business_id=business_id,
+        user_id=user.id,
+    )
+    await state.clear()
+    await message.answer(
+        f"Время утреннего напоминания изменено на <b>{hour:02d}:00</b>.",
+        reply_markup=master_notifications_keyboard(enabled, reminders),
+    )

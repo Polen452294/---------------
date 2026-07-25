@@ -32,7 +32,7 @@ class Business(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 class TelegramUser(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "telegram_users"
 
-    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     username: Mapped[str | None] = mapped_column(String(64))
     first_name: Mapped[str | None] = mapped_column(String(128))
     last_name: Mapped[str | None] = mapped_column(String(128))

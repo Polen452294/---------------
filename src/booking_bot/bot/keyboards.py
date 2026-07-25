@@ -18,6 +18,7 @@ from booking_bot.services.master_schedule import (
     MasterTimeBlock,
     WeeklyWorkingInterval,
 )
+from booking_bot.services.reminder_settings import ClientReminderSettings
 from booking_bot.specialist_config import get_specialist_template
 
 WEEKDAYS_RU = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
@@ -150,6 +151,8 @@ def confirmation_keyboard() -> InlineKeyboardMarkup:
 
 def client_appointments_keyboard(
     appointments: list[AppointmentSummary],
+    *,
+    back_callback: str = "booking:mine",
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for item in appointments:
@@ -157,12 +160,38 @@ def client_appointments_keyboard(
             text=f"{item.local_start:%d.%m %H:%M} · {item.service_name}",
             callback_data=f"appt:v:{item.appointment_id}",
         )
-    builder.button(
-        text=get_specialist_template().button("home", "В главное меню"),
-        callback_data="menu:home",
-    )
+    builder.button(text="К разделам записей", callback_data=back_callback)
     builder.adjust(1)
     return builder.as_markup()
+
+
+def client_booking_sections_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Предстоящие",
+                    callback_data="booking:list:upcoming",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Прошлые",
+                    callback_data="booking:list:past",
+                ),
+                InlineKeyboardButton(
+                    text="Отменённые",
+                    callback_data="booking:list:cancelled",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=get_specialist_template().button("home", "В главное меню"),
+                    callback_data="menu:home",
+                )
+            ],
+        ]
+    )
 
 
 def client_appointment_actions_keyboard(
@@ -186,8 +215,39 @@ def client_appointment_actions_keyboard(
                 ],
             ]
         )
+    repeatable = appointment.service_id is not None and (
+        appointment.local_end <= datetime.now(appointment.local_end.tzinfo)
+        or appointment.status
+        in {
+            AppointmentStatus.COMPLETED.value,
+            AppointmentStatus.NO_SHOW.value,
+            AppointmentStatus.CANCELLED_BY_CLIENT.value,
+            AppointmentStatus.CANCELLED_BY_MASTER.value,
+        }
+    )
+    if repeatable:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Записаться повторно",
+                    callback_data=f"appt:repeat:{appointment.appointment_id}",
+                )
+            ]
+        )
     rows.extend(
         [
+            [
+                InlineKeyboardButton(
+                    text="Добавить в календарь",
+                    callback_data=f"appt:ics:{appointment.appointment_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Связаться со специалистом",
+                    callback_data=f"appt:contact:{appointment.appointment_id}",
+                )
+            ],
             [InlineKeyboardButton(text="К моим записям", callback_data="booking:mine")],
             [
                 InlineKeyboardButton(
@@ -274,6 +334,24 @@ def master_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Неделя", callback_data="master:schedule:week")],
             [
                 InlineKeyboardButton(
+                    text="Выбрать дату",
+                    callback_data="master:schedule:choose",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить запись",
+                    callback_data="mb:start",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="master:analytics:current_month",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="Управление графиком",
                     callback_data="master:availability",
                 )
@@ -298,6 +376,104 @@ def master_menu_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def master_analytics_keyboard(selected_period: str) -> InlineKeyboardMarkup:
+    options = [
+        ("current_month", "Текущий месяц"),
+        ("previous_month", "Прошлый месяц"),
+        ("7_days", "7 дней"),
+        ("30_days", "30 дней"),
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    for index in range(0, len(options), 2):
+        row = []
+        for key, label in options[index : index + 2]:
+            marker = "• " if key == selected_period else ""
+            row.append(
+                InlineKeyboardButton(
+                    text=f"{marker}{label}",
+                    callback_data=f"master:analytics:{key}",
+                )
+            )
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="master:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def master_manual_services_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for service in services:
+        builder.button(
+            text=f"{service.name} · {_service_price_label(service)}",
+            callback_data=f"mb:s:{service.id}",
+        )
+    builder.button(text="Отмена", callback_data="mb:abort")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def master_manual_dates_keyboard(dates: list[date]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item in dates:
+        builder.button(
+            text=f"{WEEKDAYS_RU[item.weekday()]}, {item:%d.%m}",
+            callback_data=f"mb:d:{item.isoformat()}",
+        )
+    builder.button(text="Назад к услугам", callback_data="mb:start")
+    builder.button(text="Отмена", callback_data="mb:abort")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def master_manual_slots_keyboard(
+    slots: list[BookableSlot],
+    timezone,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for slot in slots:
+        builder.button(
+            text=slot.service_start.astimezone(timezone).strftime("%H:%M"),
+            callback_data=f"mb:t:{int(slot.service_start.timestamp())}",
+        )
+    builder.button(text="Назад к датам", callback_data="mb:dates")
+    builder.button(text="Отмена", callback_data="mb:abort")
+    builder.adjust(3)
+    return builder.as_markup()
+
+
+def master_manual_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data="mb:abort")],
+        ]
+    )
+
+
+def master_manual_comment_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Без комментария", callback_data="mb:comment:skip")],
+            [InlineKeyboardButton(text="Отмена", callback_data="mb:abort")],
+        ]
+    )
+
+
+def master_manual_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Создать запись", callback_data="mb:confirm")],
+            [InlineKeyboardButton(text="Отмена", callback_data="mb:abort")],
+        ]
+    )
+
+
+def _service_price_label(service: Service) -> str:
+    if service.price_minor is None:
+        return "цена не указана"
+    symbols = {"RUB": "₽", "USD": "$", "EUR": "€"}
+    amount = f"{service.price_minor / 100:,.0f}".replace(",", " ")
+    return f"{amount} {symbols.get(service.currency, service.currency)}"
 
 
 def master_services_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
@@ -391,6 +567,18 @@ def master_appointments_keyboard(
     return builder.as_markup()
 
 
+def master_schedule_dates_keyboard(dates: list[date]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item in dates:
+        builder.button(
+            text=f"{WEEKDAYS_RU[item.weekday()]}, {item:%d.%m}",
+            callback_data=f"master:schedule:date:{item.isoformat()}",
+        )
+    builder.button(text="Назад", callback_data="master:menu")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def master_appointment_actions_keyboard(
     appointment: MasterAppointment,
 ) -> InlineKeyboardMarkup:
@@ -424,6 +612,19 @@ def master_appointment_actions_keyboard(
         AppointmentStatus.PENDING_APPROVAL.value,
         AppointmentStatus.CONFIRMED.value,
     }:
+        if appointment.local_start > datetime.now(appointment.local_start.tzinfo):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Перенести",
+                        callback_data=f"master:move-start:{appointment.appointment_id}",
+                    ),
+                    InlineKeyboardButton(
+                        text="Изменить длительность",
+                        callback_data=f"master:duration:{appointment.appointment_id}",
+                    ),
+                ]
+            )
         rows.append(
             [
                 InlineKeyboardButton(
@@ -432,8 +633,35 @@ def master_appointment_actions_keyboard(
                 )
             ]
         )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Внутренняя заметка",
+                callback_data=f"master:note:{appointment.appointment_id}",
+            )
+        ]
+    )
     rows.append([InlineKeyboardButton(text="К расписанию", callback_data="master:schedule:today")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def master_reschedule_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Подтвердить перенос",
+                    callback_data="master:reschedule:confirm",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Оставить прежнее время",
+                    callback_data="master:reschedule:abort",
+                )
+            ],
+        ]
+    )
 
 
 def master_availability_keyboard() -> InlineKeyboardMarkup:
@@ -520,14 +748,42 @@ def master_blocks_keyboard(blocks: list[MasterTimeBlock]) -> InlineKeyboardMarku
     return builder.as_markup()
 
 
-def master_notifications_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+def master_notifications_keyboard(
+    enabled: bool,
+    reminders: ClientReminderSettings,
+) -> InlineKeyboardMarkup:
     state = "включены" if enabled else "выключены"
+    seven_days = "вкл." if reminders.seven_days else "выкл."
+    three_days = "вкл." if reminders.three_days else "выкл."
+    day_of = "вкл." if reminders.day_of else "выкл."
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text=f"Новые записи: {state}",
                     callback_data="master:notifications:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"За 7 дней: {seven_days}",
+                    callback_data="master:reminders:toggle:7d",
+                ),
+                InlineKeyboardButton(
+                    text=f"За 3 дня: {three_days}",
+                    callback_data="master:reminders:toggle:3d",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"В день записи: {day_of}",
+                    callback_data="master:reminders:toggle:day",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"Время утреннего напоминания: {reminders.day_of_hour:02d}:00",
+                    callback_data="master:reminders:hour",
                 )
             ],
             [InlineKeyboardButton(text="Назад", callback_data="master:menu")],

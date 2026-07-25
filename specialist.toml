@@ -21,6 +21,7 @@ no_upcoming_bookings = "У вас пока нет предстоящих зап�
 reminder_title = "⏰ <b>Напоминание о записи к Анне</b>"
 appointment_confirmed = "✅ <b>Анна подтвердила запись</b>"
 appointment_cancelled = "Анна отменила запись."
+appointment_rescheduled = "🔄 <b>Анна перенесла запись</b>"
 
 [buttons]
 book = "Записаться"

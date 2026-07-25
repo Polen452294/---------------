@@ -96,6 +96,8 @@ class AvailabilityService:
         service_id: UUID,
         local_date: date,
         now: datetime | None = None,
+        respect_min_lead_time: bool = True,
+        duration_minutes_override: int | None = None,
     ) -> list[BookableSlot]:
         now = now or datetime.now(UTC)
         if now.tzinfo is None:
@@ -129,6 +131,13 @@ class AvailabilityService:
             business_id=business_id,
             master_id=master_id,
             service_id=service_id,
+        )
+        if duration_minutes_override is not None and duration_minutes_override <= 0:
+            raise ValueError("duration_minutes_override must be positive")
+        duration = (
+            timedelta(minutes=duration_minutes_override)
+            if duration_minutes_override is not None
+            else service_config.duration
         )
 
         rules = list(
@@ -206,7 +215,9 @@ class AvailabilityService:
             ).all()
         )
         busy = [TimeInterval(item.starts_at, item.ends_at) for item in busy_entries]
-        earliest_start = now + timedelta(hours=self._settings.booking_min_lead_hours)
+        earliest_start = now + timedelta(
+            hours=self._settings.booking_min_lead_hours if respect_min_lead_time else 0
+        )
 
         found: dict[tuple[datetime, UUID | None], BookableSlot] = {}
         for window, location_id in windows:
@@ -214,7 +225,7 @@ class AvailabilityService:
             service_slots = generate_slots(
                 [window_utc],
                 busy,
-                duration=service_config.duration,
+                duration=duration,
                 step=timedelta(minutes=30),
                 buffer_before=service_config.buffer_before,
                 buffer_after=service_config.buffer_after,

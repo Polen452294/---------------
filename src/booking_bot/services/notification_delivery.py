@@ -23,6 +23,7 @@ from booking_bot.db.models import (
 )
 from booking_bot.db.session import async_session_factory
 from booking_bot.domain.enums import NotificationJobState
+from booking_bot.services.reminder_settings import get_client_reminder_settings
 from booking_bot.specialist_config import get_specialist_template
 
 
@@ -200,6 +201,19 @@ class NotificationDeliveryService:
                 "cancelled_by_master",
             }:
                 return False
+            if job.kind.startswith("client_reminder_"):
+                entry = await session.get(CalendarEntry, appointment.calendar_entry_id)
+                master = await session.get(Master, entry.master_id) if entry is not None else None
+                settings = await get_client_reminder_settings(
+                    session,
+                    business_id=job.business_id,
+                    master_user_id=master.user_id if master is not None else None,
+                )
+                return {
+                    "client_reminder_7d": settings.seven_days,
+                    "client_reminder_3d": settings.three_days,
+                    "client_reminder_day_of": settings.day_of,
+                }.get(job.kind, True)
         if job.kind not in MASTER_NOTIFICATION_KINDS:
             return True
         return await master_notifications_enabled(
@@ -220,7 +234,12 @@ class NotificationDeliveryService:
             if job.appointment_id is not None
             else None
         )
-        if recipient is None or business is None or appointment is None:
+        if (
+            recipient is None
+            or recipient.telegram_user_id is None
+            or business is None
+            or appointment is None
+        ):
             raise UnsupportedNotificationError("Notification context is incomplete")
 
         entry = await session.get(CalendarEntry, appointment.calendar_entry_id)
@@ -301,6 +320,18 @@ class NotificationDeliveryService:
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
                 f"Дата и время: <b>{local_start:%d.%m.%Y %H:%M}</b>"
                 f"{location_text}"
+            )
+        elif job.kind == "client_appointment_rescheduled":
+            text = (
+                get_specialist_template().text(
+                    "appointment_rescheduled",
+                    "🔄 <b>Специалист перенёс запись</b>",
+                )
+                + "\n\n"
+                f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
+                f"Новое время: <b>{local_start:%d.%m.%Y %H:%M}</b>"
+                f"{location_text}\n\n"
+                "Если новое время не подходит, свяжитесь со специалистом."
             )
         else:
             raise UnsupportedNotificationError(f"Unsupported notification kind: {job.kind}")
