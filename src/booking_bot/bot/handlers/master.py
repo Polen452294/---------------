@@ -1,5 +1,6 @@
 import re
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
 from html import escape
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -18,10 +19,13 @@ from booking_bot.bot.keyboards import (
     master_days_off_keyboard,
     master_menu_keyboard,
     master_notifications_keyboard,
+    master_service_actions_keyboard,
+    master_service_cancel_keyboard,
+    master_services_keyboard,
     master_weekdays_keyboard,
 )
 from booking_bot.bot.states import MasterStates
-from booking_bot.db.models import Business, Master, TelegramUser
+from booking_bot.db.models import Business, Master, Service, TelegramUser
 from booking_bot.domain.enums import AppointmentStatus
 from booking_bot.services.master_access import get_master_for_user
 from booking_bot.services.master_schedule import (
@@ -35,10 +39,21 @@ from booking_bot.services.notification_delivery import (
     master_notifications_enabled,
     toggle_master_notifications,
 )
+from booking_bot.services.service_catalog import (
+    MAX_BUFFER_MINUTES,
+    MAX_DURATION_MINUTES,
+    MAX_PRICE_MINOR,
+    MIN_DURATION_MINUTES,
+    DuplicateServiceNameError,
+    InvalidServiceValueError,
+    ServiceNotFoundError,
+    SpecialistServiceCatalog,
+)
 from booking_bot.services.users import get_or_create_telegram_user
 
 router = Router(name="master")
 schedule_service = MasterScheduleService()
+service_catalog = SpecialistServiceCatalog()
 
 STATUS_LABELS = {
     AppointmentStatus.PENDING_APPROVAL.value: "ожидает подтверждения",
@@ -60,6 +75,7 @@ DATED_RANGE_PATTERN = re.compile(
     r"(?P<start>\d{2}:\d{2})\s*-\s*(?P<end>\d{2}:\d{2})"
     r"(?:\s+(?P<reason>.+))?$"
 )
+BUFFERS_PATTERN = re.compile(r"^(?P<before>\d{1,4})\s+(?P<after>\d{1,4})$")
 
 
 async def _master_for_actor(
@@ -108,6 +124,87 @@ def _format_appointment(item: MasterAppointment) -> str:
     )
 
 
+def _format_price(service: Service) -> str:
+    if service.price_minor is None:
+        return "не указана"
+    whole, cents = divmod(service.price_minor, 100)
+    amount = f"{whole:,}".replace(",", " ")
+    if cents:
+        amount = f"{amount},{cents:02d}"
+    symbols = {"RUB": "₽", "USD": "$", "EUR": "€"}
+    return f"{amount} {symbols.get(service.currency, service.currency)}"
+
+
+def _format_service(service: Service) -> str:
+    status = "опубликована" if service.is_active else "скрыта от клиентов"
+    approval = "требуется подтверждение" if service.requires_approval else "автоматическое"
+    description = escape(service.description) if service.description else "не указано"
+    return (
+        f"<b>{escape(service.name)}</b>\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Описание: {description}\n"
+        f"Цена: <b>{_format_price(service)}</b>\n"
+        f"Длительность: <b>{service.duration_minutes} мин.</b>\n"
+        f"Перерыв до: <b>{service.buffer_before_minutes} мин.</b>\n"
+        f"Перерыв после: <b>{service.buffer_after_minutes} мин.</b>\n"
+        f"Подтверждение: <b>{approval}</b>"
+    )
+
+
+def _parse_price_minor(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"-", "нет", "не указана", "не указано", "без цены"}:
+        return None
+    normalized = re.sub(r"\s*(?:₽|rub|руб(?:\.|лей|ля)?)\s*$", "", normalized)
+    normalized = normalized.replace(" ", "").replace(",", ".")
+    if re.fullmatch(r"\d+(?:\.\d{1,2})?", normalized) is None:
+        raise InvalidServiceValueError("Invalid price")
+    try:
+        price_minor = int(Decimal(normalized) * 100)
+    except (InvalidOperation, ValueError):
+        raise InvalidServiceValueError("Invalid price") from None
+    if not 0 <= price_minor <= MAX_PRICE_MINOR:
+        raise InvalidServiceValueError("Invalid price")
+    return price_minor
+
+
+async def _service_from_state(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    business_id: UUID,
+) -> tuple[Master, Service] | None:
+    context = await _master_for_actor(message.from_user, session, business_id)
+    if context is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return None
+    _user, master = context
+    try:
+        service_id = UUID((await state.get_data())["service_id"])
+        service = await service_catalog.get_service(
+            session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+        )
+    except (KeyError, ValueError, ServiceNotFoundError):
+        await state.clear()
+        await message.answer(
+            "Услуга не найдена.",
+            reply_markup=master_services_keyboard([]),
+        )
+        return None
+    return master, service
+
+
+async def _answer_service(message: Message, service: Service) -> None:
+    await message.answer(
+        _format_service(service),
+        reply_markup=master_service_actions_keyboard(service),
+    )
+
+
 async def _deny(callback: CallbackQuery) -> None:
     await callback.answer("Кабинет доступен только владельцу бота", show_alert=True)
 
@@ -151,6 +248,376 @@ async def master_client_menu(
         reply_markup=main_menu_keyboard(master_access=True),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "master:services")
+async def master_services(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    await state.clear()
+    services = await service_catalog.list_services(
+        db_session,
+        business_id=business_id,
+        master_id=master.id,
+    )
+    text = (
+        "<b>Услуги и цены</b>\n\n"
+        "✅ — доступна клиентам\n"
+        "⏸ — скрыта\n\n"
+        "Выберите услугу для настройки."
+        if services
+        else "<b>Услуги и цены</b>\n\nУслуг пока нет."
+    )
+    await _edit(callback, text, reply_markup=master_services_keyboard(services))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "svc:new")
+async def master_create_service(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if await _master_for_actor(callback.from_user, db_session, business_id) is None:
+        await _deny(callback)
+        return
+    await state.clear()
+    await state.set_state(MasterStates.waiting_service_create_name)
+    await _edit(
+        callback,
+        "Отправьте название новой услуги.\n\n"
+        "Она будет создана скрытой. Настройте параметры, а затем опубликуйте её.",
+        reply_markup=master_service_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.message(MasterStates.waiting_service_create_name, F.text)
+async def master_receive_new_service_name(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(message.from_user, db_session, business_id)
+    if context is None:
+        await state.clear()
+        await message.answer("Кабинет специалиста недоступен.")
+        return
+    _user, master = context
+    try:
+        service = await service_catalog.create_service(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            name=message.text or "",
+        )
+    except DuplicateServiceNameError:
+        await message.answer("Услуга с таким названием уже существует.")
+        return
+    except InvalidServiceValueError:
+        await message.answer("Название должно содержать от 2 до 160 символов.")
+        return
+    await state.clear()
+    await message.answer("Услуга создана. Заполните параметры и нажмите «Опубликовать услугу».")
+    await _answer_service(message, service)
+
+
+@router.callback_query(F.data.startswith("svc:v:"))
+async def master_service_details(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        service_id = UUID((callback.data or "").rsplit(":", 1)[-1])
+        service = await service_catalog.get_service(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+        )
+    except (ValueError, ServiceNotFoundError):
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    await state.clear()
+    await _edit(
+        callback,
+        _format_service(service),
+        reply_markup=master_service_actions_keyboard(service),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("svc:e:"))
+async def master_edit_service(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        _prefix, _edit_action, field, service_raw = (callback.data or "").split(":")
+        service_id = UUID(service_raw)
+        await service_catalog.get_service(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service_id,
+        )
+        state_and_prompt = {
+            "n": (
+                MasterStates.waiting_service_name,
+                "Отправьте новое название услуги:",
+            ),
+            "d": (
+                MasterStates.waiting_service_description,
+                "Отправьте новое описание. Чтобы удалить описание, отправьте <code>-</code>.",
+            ),
+            "t": (
+                MasterStates.waiting_service_duration,
+                f"Отправьте длительность в минутах: от {MIN_DURATION_MINUTES} "
+                f"до {MAX_DURATION_MINUTES}.",
+            ),
+            "p": (
+                MasterStates.waiting_service_price,
+                "Отправьте цену в рублях, например <code>3500</code> или "
+                "<code>3500,50</code>.\nЧтобы скрыть цену, отправьте <code>-</code>.",
+            ),
+            "b": (
+                MasterStates.waiting_service_buffers,
+                "Отправьте два числа через пробел: перерыв до и после услуги в минутах.\n"
+                "Например: <code>15 30</code>.",
+            ),
+        }
+        target_state, prompt = state_and_prompt[field]
+    except (ValueError, KeyError, ServiceNotFoundError):
+        await callback.answer("Услуга или поле не найдены", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(service_id=str(service_id))
+    await state.set_state(target_state)
+    await _edit(
+        callback,
+        prompt,
+        reply_markup=master_service_cancel_keyboard(service_id),
+    )
+    await callback.answer()
+
+
+@router.message(MasterStates.waiting_service_name, F.text)
+async def master_receive_service_name(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _service_from_state(message, state, db_session, business_id)
+    if context is None:
+        return
+    master, service = context
+    try:
+        service = await service_catalog.set_name(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service.id,
+            name=message.text or "",
+        )
+    except DuplicateServiceNameError:
+        await message.answer("Услуга с таким названием уже существует.")
+        return
+    except InvalidServiceValueError:
+        await message.answer("Название должно содержать от 2 до 160 символов.")
+        return
+    await state.clear()
+    await _answer_service(message, service)
+
+
+@router.message(MasterStates.waiting_service_description, F.text)
+async def master_receive_service_description(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _service_from_state(message, state, db_session, business_id)
+    if context is None:
+        return
+    master, service = context
+    raw_description = (message.text or "").strip()
+    description = (
+        None if raw_description.lower() in {"-", "нет", "без описания"} else raw_description
+    )
+    try:
+        service = await service_catalog.set_description(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service.id,
+            description=description,
+        )
+    except InvalidServiceValueError:
+        await message.answer("Описание не должно быть длиннее 2000 символов.")
+        return
+    await state.clear()
+    await _answer_service(message, service)
+
+
+@router.message(MasterStates.waiting_service_duration, F.text)
+async def master_receive_service_duration(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _service_from_state(message, state, db_session, business_id)
+    if context is None:
+        return
+    master, service = context
+    try:
+        duration = int((message.text or "").strip())
+        service = await service_catalog.set_duration(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service.id,
+            duration_minutes=duration,
+        )
+    except (ValueError, InvalidServiceValueError):
+        await message.answer(
+            f"Введите целое число от {MIN_DURATION_MINUTES} до {MAX_DURATION_MINUTES}."
+        )
+        return
+    await state.clear()
+    await _answer_service(message, service)
+
+
+@router.message(MasterStates.waiting_service_price, F.text)
+async def master_receive_service_price(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _service_from_state(message, state, db_session, business_id)
+    if context is None:
+        return
+    master, service = context
+    try:
+        price_minor = _parse_price_minor(message.text or "")
+        service = await service_catalog.set_price(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service.id,
+            price_minor=price_minor,
+        )
+    except InvalidServiceValueError:
+        await message.answer("Введите корректную цену, например <code>3500</code>, или «-».")
+        return
+    await state.clear()
+    await _answer_service(message, service)
+
+
+@router.message(MasterStates.waiting_service_buffers, F.text)
+async def master_receive_service_buffers(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _service_from_state(message, state, db_session, business_id)
+    if context is None:
+        return
+    master, service = context
+    match = BUFFERS_PATTERN.fullmatch((message.text or "").strip())
+    if match is None:
+        await message.answer("Отправьте два целых числа, например <code>15 30</code>.")
+        return
+    try:
+        service = await service_catalog.set_buffers(
+            db_session,
+            business_id=business_id,
+            master_id=master.id,
+            service_id=service.id,
+            buffer_before_minutes=int(match.group("before")),
+            buffer_after_minutes=int(match.group("after")),
+        )
+    except InvalidServiceValueError:
+        await message.answer(f"Каждый перерыв должен быть от 0 до {MAX_BUFFER_MINUTES} минут.")
+        return
+    await state.clear()
+    await _answer_service(message, service)
+
+
+@router.callback_query(F.data.startswith("svc:t:"))
+async def master_toggle_service_setting(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        _prefix, _toggle, setting, service_raw = (callback.data or "").split(":")
+        service_id = UUID(service_raw)
+        if setting == "r":
+            service = await service_catalog.toggle_approval(
+                db_session,
+                business_id=business_id,
+                master_id=master.id,
+                service_id=service_id,
+            )
+            result_text = (
+                "Ручное подтверждение включено"
+                if service.requires_approval
+                else "Автоподтверждение включено"
+            )
+        elif setting == "a":
+            service = await service_catalog.toggle_active(
+                db_session,
+                business_id=business_id,
+                master_id=master.id,
+                service_id=service_id,
+            )
+            result_text = "Услуга опубликована" if service.is_active else "Услуга скрыта"
+        else:
+            raise ValueError
+    except (ValueError, ServiceNotFoundError):
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+    await state.clear()
+    await _edit(
+        callback,
+        _format_service(service),
+        reply_markup=master_service_actions_keyboard(service),
+    )
+    await callback.answer(result_text)
 
 
 @router.callback_query(F.data.startswith("master:schedule:"))

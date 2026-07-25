@@ -42,6 +42,7 @@ class Service(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     requires_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     requires_deposit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     deposit_minor: Mapped[int | None] = mapped_column(Integer)
+    is_owner_managed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 

@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from uuid import UUID
 
 from aiogram.types import (
     InlineKeyboardButton,
@@ -176,6 +177,12 @@ def master_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="Услуги и цены",
+                    callback_data="master:services",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="Уведомления",
                     callback_data="master:notifications",
                 )
@@ -186,6 +193,80 @@ def master_menu_keyboard() -> InlineKeyboardMarkup:
                     callback_data="master:client-menu",
                 )
             ],
+        ]
+    )
+
+
+def master_services_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for service in services:
+        status = "✅" if service.is_active else "⏸"
+        builder.button(
+            text=f"{status} {service.name}",
+            callback_data=f"svc:v:{service.id}",
+        )
+    builder.button(text="➕ Добавить услугу", callback_data="svc:new")
+    builder.button(
+        text=get_specialist_template().button("specialist_cabinet", "Мой кабинет"),
+        callback_data="master:menu",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def master_service_actions_keyboard(service: Service) -> InlineKeyboardMarkup:
+    approval = "✅ Ручное подтверждение" if service.requires_approval else "Автоподтверждение"
+    visibility = "Скрыть услугу" if service.is_active else "Опубликовать услугу"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Название",
+                    callback_data=f"svc:e:n:{service.id}",
+                ),
+                InlineKeyboardButton(
+                    text="Описание",
+                    callback_data=f"svc:e:d:{service.id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Длительность",
+                    callback_data=f"svc:e:t:{service.id}",
+                ),
+                InlineKeyboardButton(
+                    text="Цена",
+                    callback_data=f"svc:e:p:{service.id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Перерывы",
+                    callback_data=f"svc:e:b:{service.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=approval,
+                    callback_data=f"svc:t:r:{service.id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=visibility,
+                    callback_data=f"svc:t:a:{service.id}",
+                )
+            ],
+            [InlineKeyboardButton(text="К списку услуг", callback_data="master:services")],
+        ]
+    )
+
+
+def master_service_cancel_keyboard(service_id: UUID | None = None) -> InlineKeyboardMarkup:
+    callback_data = f"svc:v:{service_id}" if service_id is not None else "master:services"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data=callback_data)],
         ]
     )
 

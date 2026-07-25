@@ -128,18 +128,19 @@ async def configure_specialist(
             session.add(service)
             await session.flush()
             existing_services.append(service)
-        service.config_key = item.key
-        service.name = item.name
-        service.description = item.description
-        service.duration_minutes = item.duration_minutes
-        service.buffer_before_minutes = item.buffer_before_minutes
-        service.buffer_after_minutes = item.buffer_after_minutes
-        service.price_minor = item.price_minor
-        service.currency = template.profile.currency
-        service.requires_approval = item.requires_approval
-        service.requires_deposit = False
-        service.deposit_minor = None
-        service.is_active = True
+        if not service.is_owner_managed:
+            service.config_key = item.key
+            service.name = item.name
+            service.description = item.description
+            service.duration_minutes = item.duration_minutes
+            service.buffer_before_minutes = item.buffer_before_minutes
+            service.buffer_after_minutes = item.buffer_after_minutes
+            service.price_minor = item.price_minor
+            service.currency = template.profile.currency
+            service.requires_approval = item.requires_approval
+            service.requires_deposit = False
+            service.deposit_minor = None
+            service.is_active = True
 
         link = await session.scalar(
             select(MasterService).where(
@@ -153,14 +154,20 @@ async def configure_specialist(
                     business_id=business.id,
                     master_id=master.id,
                     service_id=service.id,
+                    is_active=service.is_active,
                 )
             )
         else:
             link.business_id = business.id
-            link.is_active = True
+            if not service.is_owner_managed:
+                link.is_active = True
 
     for service in existing_services:
-        if service.config_key is not None and service.config_key not in configured_keys:
+        if (
+            not service.is_owner_managed
+            and service.config_key is not None
+            and service.config_key not in configured_keys
+        ):
             service.is_active = False
 
     existing_working_rule = await session.scalar(
