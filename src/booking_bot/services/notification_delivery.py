@@ -34,6 +34,13 @@ class UnsupportedNotificationError(NotificationDeliveryError):
     pass
 
 
+MASTER_NOTIFICATION_KINDS = {
+    "master_new_appointment",
+    "master_appointment_cancelled_by_client",
+    "master_appointment_rescheduled_by_client",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class DeliveryPayload:
     chat_id: int
@@ -193,7 +200,7 @@ class NotificationDeliveryService:
                 "cancelled_by_master",
             }:
                 return False
-        if job.kind != "master_new_appointment":
+        if job.kind not in MASTER_NOTIFICATION_KINDS:
             return True
         return await master_notifications_enabled(
             session,
@@ -236,6 +243,28 @@ class NotificationDeliveryService:
                 "🔔 <b>Новая запись</b>\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
                 f"Дата и время: <b>{local_start:%d.%m.%Y %H:%M}</b>\n"
+                f"Клиент: <b>{client_name}</b>\n"
+                f"Телефон: <code>{phone}</code>"
+                f"{location_text}"
+            )
+        elif job.kind == "master_appointment_cancelled_by_client":
+            client_name = escape(appointment.client_name_snapshot or "Клиент")
+            phone = escape(appointment.client_phone_snapshot or "не указан")
+            text = (
+                "❌ <b>Клиент отменил запись</b>\n\n"
+                f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
+                f"Дата и время: <b>{local_start:%d.%m.%Y %H:%M}</b>\n"
+                f"Клиент: <b>{client_name}</b>\n"
+                f"Телефон: <code>{phone}</code>"
+                f"{location_text}"
+            )
+        elif job.kind == "master_appointment_rescheduled_by_client":
+            client_name = escape(appointment.client_name_snapshot or "Клиент")
+            phone = escape(appointment.client_phone_snapshot or "не указан")
+            text = (
+                "🔄 <b>Клиент перенёс запись</b>\n\n"
+                f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
+                f"Новое время: <b>{local_start:%d.%m.%Y %H:%M}</b>\n"
                 f"Клиент: <b>{client_name}</b>\n"
                 f"Телефон: <code>{phone}</code>"
                 f"{location_text}"

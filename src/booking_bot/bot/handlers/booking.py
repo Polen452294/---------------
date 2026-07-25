@@ -11,18 +11,33 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from booking_bot.bot.keyboards import (
+    client_appointment_actions_keyboard,
+    client_appointments_keyboard,
+    client_cancel_confirmation_keyboard,
     confirmation_keyboard,
     dates_keyboard,
     main_menu_keyboard,
     phone_keyboard,
+    reschedule_confirmation_keyboard,
     services_keyboard,
     slots_keyboard,
 )
 from booking_bot.bot.states import BookingStates
 from booking_bot.config import Settings, get_settings
-from booking_bot.db.models import Business, Master, MasterService, Service, TelegramUser
+from booking_bot.db.models import (
+    Appointment,
+    Business,
+    CalendarEntry,
+    Master,
+    MasterService,
+    Service,
+    TelegramUser,
+)
 from booking_bot.services.availability import AvailabilityService, BookingConfigurationError
 from booking_bot.services.bookings import (
+    AppointmentChangeNotAllowedError,
+    AppointmentNotFoundError,
+    AppointmentSummary,
     BookingService,
     ClientPhoneRequiredError,
     HoldExpiredError,
@@ -63,6 +78,44 @@ def _format_hold(summary: HoldSummary) -> str:
         f"Время: <b>{summary.local_start:%H:%M}-{summary.local_end:%H:%M}</b>"
         f"{location}\n\n"
         "Время временно удерживается за вами."
+    )
+
+
+def _format_reschedule_hold(summary: HoldSummary) -> str:
+    location = f"\nАдрес: <b>{escape(summary.location_name)}</b>" if summary.location_name else ""
+    return (
+        "Проверьте новое время:\n\n"
+        f"Услуга: <b>{escape(summary.service_name)}</b>\n"
+        f"Дата: <b>{summary.local_start:%d.%m.%Y}</b>\n"
+        f"Время: <b>{summary.local_start:%H:%M}-{summary.local_end:%H:%M}</b>"
+        f"{location}\n\n"
+        "Старая запись сохранится, пока вы не подтвердите перенос."
+    )
+
+
+def _format_appointment(summary: AppointmentSummary) -> str:
+    status_labels = {
+        "pending_approval": "Ожидает подтверждения",
+        "pending_payment": "Ожидает оплаты",
+        "confirmed": "Подтверждена",
+        "cancelled_by_client": "Отменена вами",
+        "cancelled_by_master": "Отменена специалистом",
+        "completed": "Выполнена",
+        "no_show": "Не состоялась",
+    }
+    location = f"\nАдрес: <b>{escape(summary.location_name)}</b>" if summary.location_name else ""
+    change_note = (
+        f"\n\nПеренос и отмена доступны до <b>{summary.change_deadline:%d.%m.%Y %H:%M}</b>."
+        if summary.can_change
+        else "\n\nСрок самостоятельного переноса и отмены уже истёк."
+    )
+    return (
+        f"<b>{escape(summary.service_name)}</b>\n\n"
+        f"Статус: <b>{status_labels.get(summary.status, escape(summary.status))}</b>\n"
+        f"Специалист: <b>{escape(summary.master_name)}</b>\n"
+        f"Дата: <b>{summary.local_start:%d.%m.%Y}</b>\n"
+        f"Время: <b>{summary.local_start:%H:%M}-{summary.local_end:%H:%M}</b>"
+        f"{location}{change_note}"
     )
 
 
@@ -111,6 +164,42 @@ async def _show_dates(
         callback,
         "Выберите дату:",
         reply_markup=dates_keyboard(dates),
+    )
+    await callback.answer()
+
+
+async def _show_reschedule_dates(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    data = await state.get_data()
+    try:
+        master_id = UUID(data["master_id"])
+        appointment_id = UUID(data["appointment_id"])
+    except (KeyError, ValueError):
+        await state.clear()
+        await callback.answer("Начните перенос заново", show_alert=True)
+        return
+    master = await session.get(Master, master_id)
+    business = await session.get(Business, business_id)
+    if master is None or business is None:
+        await callback.answer("Перенос временно недоступен", show_alert=True)
+        return
+    timezone = ZoneInfo(master.timezone or business.timezone)
+    today = datetime.now(UTC).astimezone(timezone).date()
+    dates = [today + timedelta(days=offset) for offset in range(_settings().booking_dates_shown)]
+    await state.set_state(BookingStates.rescheduling_date)
+    await _edit_or_answer(
+        callback,
+        "Выберите новую дату:",
+        reply_markup=dates_keyboard(
+            dates,
+            callback_prefix="rdate",
+            back_callback=f"appt:v:{appointment_id}",
+            back_text="Назад к записи",
+        ),
     )
     await callback.answer()
 
@@ -488,13 +577,410 @@ async def my_bookings(
             "no_upcoming_bookings",
             "У вас пока нет предстоящих записей.",
         )
+        reply_markup = main_menu_keyboard()
     else:
-        parts = ["Ваши предстоящие записи:"]
-        for item in appointments:
-            location = f", {escape(item.location_name)}" if item.location_name else ""
-            parts.append(
-                f"\n<b>{item.local_start:%d.%m.%Y %H:%M}</b>\n{escape(item.service_name)}{location}"
+        text = "Ваши предстоящие записи:\n\nВыберите запись, чтобы посмотреть детали."
+        reply_markup = client_appointments_keyboard(appointments)
+    await _edit_or_answer(callback, text, reply_markup=reply_markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("appt:v:"))
+async def view_client_appointment(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if callback.from_user is None:
+        return
+    try:
+        appointment_id = UUID(callback.data.split(":", 2)[2])
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная запись", show_alert=True)
+        return
+    user = await get_or_create_telegram_user(db_session, callback.from_user)
+    try:
+        summary = await BookingService(_settings()).get_appointment(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
+            appointment_id=appointment_id,
+        )
+    except AppointmentNotFoundError:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    await state.clear()
+    await _edit_or_answer(
+        callback,
+        _format_appointment(summary),
+        reply_markup=client_appointment_actions_keyboard(summary),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("appt:c:"))
+async def request_client_cancellation(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if callback.from_user is None:
+        return
+    try:
+        appointment_id = UUID(callback.data.split(":", 2)[2])
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная запись", show_alert=True)
+        return
+    user = await get_or_create_telegram_user(db_session, callback.from_user)
+    try:
+        summary = await BookingService(_settings()).get_appointment(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
+            appointment_id=appointment_id,
+        )
+    except AppointmentNotFoundError:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    if not summary.can_change:
+        await callback.answer(
+            f"Отмена доступна не позднее чем за "
+            f"{_settings().cancellation_cutoff_hours} ч. до записи",
+            show_alert=True,
+        )
+        return
+    await _edit_or_answer(
+        callback,
+        "Точно отменить эту запись?\n\n" + _format_appointment(summary),
+        reply_markup=client_cancel_confirmation_keyboard(appointment_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("appt:cy:"))
+async def confirm_client_cancellation(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if callback.from_user is None:
+        return
+    try:
+        appointment_id = UUID(callback.data.split(":", 2)[2])
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная запись", show_alert=True)
+        return
+    user = await get_or_create_telegram_user(db_session, callback.from_user)
+    try:
+        summary = await BookingService(_settings()).cancel_appointment(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
+            appointment_id=appointment_id,
+        )
+    except AppointmentNotFoundError:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    except AppointmentChangeNotAllowedError:
+        await callback.answer(
+            f"Отмена уже недоступна: до записи осталось меньше "
+            f"{_settings().cancellation_cutoff_hours} ч.",
+            show_alert=True,
+        )
+        return
+    await state.clear()
+    await _edit_or_answer(
+        callback,
+        "Запись отменена.\n\n"
+        f"<b>{escape(summary.service_name)}</b>\n"
+        f"{summary.local_start:%d.%m.%Y %H:%M}",
+        reply_markup=main_menu_keyboard(),
+    )
+    await callback.answer("Запись отменена")
+
+
+@router.callback_query(F.data.startswith("appt:r:"))
+async def start_client_reschedule(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    if callback.from_user is None:
+        return
+    try:
+        appointment_id = UUID(callback.data.split(":", 2)[2])
+    except (AttributeError, ValueError):
+        await callback.answer("Некорректная запись", show_alert=True)
+        return
+    user = await get_or_create_telegram_user(db_session, callback.from_user)
+    booking_service = BookingService(_settings())
+    try:
+        summary = await booking_service.get_appointment(
+            db_session,
+            business_id=business_id,
+            client_id=user.id,
+            appointment_id=appointment_id,
+        )
+    except AppointmentNotFoundError:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    if not summary.can_change:
+        await callback.answer(
+            f"Перенос доступен не позднее чем за "
+            f"{_settings().cancellation_cutoff_hours} ч. до записи",
+            show_alert=True,
+        )
+        return
+
+    appointment = await db_session.scalar(
+        select(Appointment).where(
+            Appointment.id == appointment_id,
+            Appointment.business_id == business_id,
+            Appointment.client_id == user.id,
+        )
+    )
+    entry = (
+        await db_session.get(CalendarEntry, appointment.calendar_entry_id)
+        if appointment is not None
+        else None
+    )
+    if appointment is None or appointment.service_id is None or entry is None:
+        await callback.answer("Перенос этой записи недоступен", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        appointment_id=str(appointment.id),
+        client_id=str(user.id),
+        service_id=str(appointment.service_id),
+        master_id=str(entry.master_id),
+    )
+    await _show_reschedule_dates(callback, state, db_session, business_id)
+
+
+@router.callback_query(F.data == "appt:rd")
+async def back_to_reschedule_dates(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    await _show_reschedule_dates(callback, state, db_session, business_id)
+
+
+@router.callback_query(
+    BookingStates.rescheduling_date,
+    F.data.startswith("rdate:"),
+)
+async def select_reschedule_date(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    try:
+        local_date = date.fromisoformat(callback.data.split(":", 1)[1])
+        data = await state.get_data()
+        service_id = UUID(data["service_id"])
+        master_id = UUID(data["master_id"])
+        appointment_id = UUID(data["appointment_id"])
+    except (AttributeError, KeyError, ValueError):
+        await callback.answer("Начните перенос заново", show_alert=True)
+        return
+    try:
+        slots = await AvailabilityService(_settings()).list_slots(
+            db_session,
+            business_id=business_id,
+            master_id=master_id,
+            service_id=service_id,
+            local_date=local_date,
+        )
+    except BookingConfigurationError:
+        await callback.answer("Расписание настроено некорректно", show_alert=True)
+        return
+    master = await db_session.get(Master, master_id)
+    business = await db_session.get(Business, business_id)
+    if master is None or business is None:
+        await callback.answer("Перенос временно недоступен", show_alert=True)
+        return
+    timezone = ZoneInfo(master.timezone or business.timezone)
+    await state.update_data(local_date=local_date.isoformat())
+    if not slots:
+        today = datetime.now(UTC).astimezone(timezone).date()
+        dates = [
+            today + timedelta(days=offset) for offset in range(_settings().booking_dates_shown)
+        ]
+        await _edit_or_answer(
+            callback,
+            "На эту дату свободных окон нет. Выберите другую дату:",
+            reply_markup=dates_keyboard(
+                dates,
+                callback_prefix="rdate",
+                back_callback=f"appt:v:{appointment_id}",
+                back_text="Назад к записи",
+            ),
+        )
+    else:
+        await state.set_state(BookingStates.rescheduling_slot)
+        await _edit_or_answer(
+            callback,
+            f"Свободное время на {local_date:%d.%m.%Y}:",
+            reply_markup=slots_keyboard(
+                slots,
+                timezone,
+                callback_prefix="rslot",
+                back_callback="appt:rd",
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(
+    BookingStates.rescheduling_slot,
+    F.data.startswith("rslot:"),
+)
+async def select_reschedule_slot(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    try:
+        service_start = datetime.fromtimestamp(
+            int(callback.data.split(":", 1)[1]),
+            tz=UTC,
+        )
+        data = await state.get_data()
+        service_id = UUID(data["service_id"])
+        master_id = UUID(data["master_id"])
+        client_id = UUID(data["client_id"])
+        local_date = date.fromisoformat(data["local_date"])
+    except (AttributeError, KeyError, TypeError, ValueError):
+        await callback.answer("Начните перенос заново", show_alert=True)
+        return
+    booking_service = BookingService(_settings())
+    try:
+        hold = await booking_service.create_hold(
+            db_session,
+            business_id=business_id,
+            master_id=master_id,
+            service_id=service_id,
+            client_id=client_id,
+            service_start=service_start,
+            local_date=local_date,
+        )
+    except SlotUnavailableError:
+        await callback.answer(
+            "Это время уже занято. Выберите другое.",
+            show_alert=True,
+        )
+        return
+    await state.update_data(hold_id=str(hold.id))
+    await state.set_state(BookingStates.rescheduling_confirming)
+    summary = await booking_service.get_hold_summary(
+        db_session,
+        hold_id=hold.id,
+        client_id=client_id,
+    )
+    await _edit_or_answer(
+        callback,
+        _format_reschedule_hold(summary),
+        reply_markup=reschedule_confirmation_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    BookingStates.rescheduling_confirming,
+    F.data == "appt:rc",
+)
+async def confirm_client_reschedule(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    data = await state.get_data()
+    booking_service = BookingService(_settings())
+    try:
+        hold_id = UUID(data["hold_id"])
+        client_id = UUID(data["client_id"])
+        summary = await booking_service.confirm_reschedule(
+            db_session,
+            business_id=business_id,
+            client_id=client_id,
+            appointment_id=UUID(data["appointment_id"]),
+            hold_id=hold_id,
+        )
+    except (KeyError, ValueError, AppointmentNotFoundError):
+        await state.clear()
+        await callback.answer("Не удалось найти запись", show_alert=True)
+        return
+    except AppointmentChangeNotAllowedError:
+        if "hold_id" in data and "client_id" in data:
+            await booking_service.release_hold(
+                db_session,
+                hold_id=UUID(data["hold_id"]),
+                client_id=UUID(data["client_id"]),
             )
-        text = "\n".join(parts)
-    await _edit_or_answer(callback, text, reply_markup=main_menu_keyboard())
+        await state.clear()
+        await callback.answer(
+            "Срок самостоятельного переноса уже истёк",
+            show_alert=True,
+        )
+        return
+    except (HoldNotFoundError, HoldExpiredError):
+        await state.clear()
+        await callback.answer(
+            "Время больше не удерживается. Начните перенос заново.",
+            show_alert=True,
+        )
+        return
+    await state.clear()
+    await _edit_or_answer(
+        callback,
+        "Запись перенесена.\n\n" + _format_appointment(summary),
+        reply_markup=client_appointment_actions_keyboard(summary),
+    )
+    await callback.answer("Новое время сохранено")
+
+
+@router.callback_query(F.data == "appt:ra")
+async def abort_client_reschedule(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    data = await state.get_data()
+    booking_service = BookingService(_settings())
+    if "hold_id" in data and "client_id" in data:
+        await booking_service.release_hold(
+            db_session,
+            hold_id=UUID(data["hold_id"]),
+            client_id=UUID(data["client_id"]),
+        )
+    try:
+        summary = await booking_service.get_appointment(
+            db_session,
+            business_id=business_id,
+            client_id=UUID(data["client_id"]),
+            appointment_id=UUID(data["appointment_id"]),
+        )
+    except (KeyError, ValueError, AppointmentNotFoundError):
+        await state.clear()
+        await _edit_or_answer(
+            callback,
+            "Прежнее время записи сохранено.",
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        await state.clear()
+        await _edit_or_answer(
+            callback,
+            "Прежнее время записи сохранено.\n\n" + _format_appointment(summary),
+            reply_markup=client_appointment_actions_keyboard(summary),
+        )
     await callback.answer()

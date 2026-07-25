@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,14 @@ class ClientPhoneRequiredError(RuntimeError):
     pass
 
 
+class AppointmentNotFoundError(LookupError):
+    pass
+
+
+class AppointmentChangeNotAllowedError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class HoldSummary:
     hold_id: UUID
@@ -69,6 +77,8 @@ class AppointmentSummary:
     local_start: datetime
     local_end: datetime
     status: str
+    can_change: bool
+    change_deadline: datetime
 
 
 class BookingService:
@@ -284,6 +294,9 @@ class BookingService:
             local_start=appointment.service_starts_at.astimezone(timezone),
             local_end=appointment.service_ends_at.astimezone(timezone),
             status=appointment.status,
+            can_change=self._can_change(appointment, now),
+            change_deadline=appointment.service_starts_at.astimezone(timezone)
+            - timedelta(hours=self._settings.cancellation_cutoff_hours),
         )
 
     async def release_hold(
@@ -352,11 +365,263 @@ class BookingService:
                     ZoneInfo(master.timezone or business.timezone)
                 ),
                 status=appointment.status,
+                can_change=self._can_change(appointment, now),
+                change_deadline=appointment.service_starts_at.astimezone(
+                    ZoneInfo(master.timezone or business.timezone)
+                )
+                - timedelta(hours=self._settings.cancellation_cutoff_hours),
             )
             for appointment, _entry, master, business, location in rows
         ]
 
+    async def get_appointment(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        client_id: UUID,
+        appointment_id: UUID,
+        now: datetime | None = None,
+    ) -> AppointmentSummary:
+        now = now or datetime.now(UTC)
+        row = (
+            await session.execute(
+                select(Appointment, CalendarEntry, Master, Business, Location)
+                .join(CalendarEntry, CalendarEntry.id == Appointment.calendar_entry_id)
+                .join(Master, Master.id == CalendarEntry.master_id)
+                .join(Business, Business.id == Appointment.business_id)
+                .outerjoin(Location, Location.id == CalendarEntry.location_id)
+                .where(
+                    Appointment.id == appointment_id,
+                    Appointment.business_id == business_id,
+                    Appointment.client_id == client_id,
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            raise AppointmentNotFoundError
+        appointment, _entry, master, business, location = row
+        return self._appointment_summary(
+            appointment=appointment,
+            master=master,
+            business=business,
+            location=location,
+            now=now,
+        )
+
+    async def cancel_appointment(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        client_id: UUID,
+        appointment_id: UUID,
+        now: datetime | None = None,
+    ) -> AppointmentSummary:
+        now = now or datetime.now(UTC)
+        appointment = await self._get_changeable_appointment(
+            session,
+            business_id=business_id,
+            client_id=client_id,
+            appointment_id=appointment_id,
+            now=now,
+        )
+        entry = await session.get(CalendarEntry, appointment.calendar_entry_id)
+        if entry is None:
+            raise AppointmentNotFoundError
+        master = await session.get(Master, entry.master_id)
+        business = await session.get(Business, appointment.business_id)
+        location = (
+            await session.get(Location, entry.location_id)
+            if entry.location_id is not None
+            else None
+        )
+        if master is None or business is None:
+            raise AppointmentNotFoundError
+
+        previous_status = appointment.status
+        appointment.status = AppointmentStatus.CANCELLED_BY_CLIENT.value
+        appointment.lock_version += 1
+        entry.state = CalendarEntryState.RELEASED.value
+        await self._cancel_pending_notifications(
+            session,
+            appointment_id=appointment.id,
+        )
+        if master.user_id is not None:
+            self._schedule_master_notification(
+                session,
+                appointment=appointment,
+                master=master,
+                business=business,
+                kind="master_appointment_cancelled_by_client",
+                now=now,
+            )
+        session.add(
+            AppointmentHistory(
+                business_id=business.id,
+                appointment_id=appointment.id,
+                actor_user_id=client_id,
+                event_type="cancelled_by_client",
+                from_status=previous_status,
+                to_status=appointment.status,
+            )
+        )
+        await session.flush()
+        return self._appointment_summary(
+            appointment=appointment,
+            master=master,
+            business=business,
+            location=location,
+            now=now,
+        )
+
+    async def confirm_reschedule(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        client_id: UUID,
+        appointment_id: UUID,
+        hold_id: UUID,
+        now: datetime | None = None,
+    ) -> AppointmentSummary:
+        now = now or datetime.now(UTC)
+        appointment = await self._get_changeable_appointment(
+            session,
+            business_id=business_id,
+            client_id=client_id,
+            appointment_id=appointment_id,
+            now=now,
+        )
+        hold = await session.scalar(
+            select(SlotHold)
+            .where(
+                SlotHold.id == hold_id,
+                SlotHold.business_id == business_id,
+                SlotHold.client_id == client_id,
+            )
+            .with_for_update()
+        )
+        if hold is None:
+            raise HoldNotFoundError
+
+        old_entry = await session.get(CalendarEntry, appointment.calendar_entry_id)
+        new_entry = await session.get(CalendarEntry, hold.calendar_entry_id)
+        if (
+            hold.status != HoldStatus.ACTIVE.value
+            or hold.expires_at <= now
+            or new_entry is None
+            or new_entry.state != CalendarEntryState.ACTIVE.value
+        ):
+            if new_entry is not None and new_entry.state == CalendarEntryState.ACTIVE.value:
+                new_entry.state = CalendarEntryState.EXPIRED.value
+            hold.status = HoldStatus.EXPIRED.value
+            await session.flush()
+            raise HoldExpiredError("The slot hold has expired")
+        if (
+            old_entry is None
+            or hold.service_id != appointment.service_id
+            or new_entry.master_id != old_entry.master_id
+        ):
+            raise AppointmentChangeNotAllowedError("The hold does not match the appointment")
+
+        master = await session.get(Master, new_entry.master_id)
+        business = await session.get(Business, appointment.business_id)
+        client = await session.get(TelegramUser, client_id)
+        location = (
+            await session.get(Location, new_entry.location_id)
+            if new_entry.location_id is not None
+            else None
+        )
+        if master is None or business is None or client is None:
+            raise AppointmentNotFoundError
+
+        old_starts_at = appointment.service_starts_at
+        old_ends_at = appointment.service_ends_at
+        old_entry.state = CalendarEntryState.RELEASED.value
+        new_entry.kind = CalendarEntryKind.APPOINTMENT.value
+        hold.status = HoldStatus.CONVERTED.value
+        appointment.calendar_entry_id = new_entry.id
+        appointment.service_starts_at = hold.service_starts_at
+        appointment.service_ends_at = hold.service_ends_at
+        appointment.duration_minutes = int(
+            (hold.service_ends_at - hold.service_starts_at).total_seconds() // 60
+        )
+        appointment.lock_version += 1
+
+        await self._cancel_pending_notifications(
+            session,
+            appointment_id=appointment.id,
+        )
+        self._schedule_client_reminders(
+            session,
+            appointment=appointment,
+            client=client,
+            master=master,
+            business=business,
+            now=now,
+        )
+        self._schedule_master_notification(
+            session,
+            appointment=appointment,
+            master=master,
+            business=business,
+            kind="master_appointment_rescheduled_by_client",
+            now=now,
+        )
+        session.add(
+            AppointmentHistory(
+                business_id=business.id,
+                appointment_id=appointment.id,
+                actor_user_id=client.id,
+                event_type="rescheduled_by_client",
+                from_status=appointment.status,
+                to_status=appointment.status,
+                event_payload={
+                    "old_starts_at": old_starts_at.isoformat(),
+                    "old_ends_at": old_ends_at.isoformat(),
+                    "new_starts_at": appointment.service_starts_at.isoformat(),
+                    "new_ends_at": appointment.service_ends_at.isoformat(),
+                },
+            )
+        )
+        await session.flush()
+        return self._appointment_summary(
+            appointment=appointment,
+            master=master,
+            business=business,
+            location=location,
+            now=now,
+        )
+
     async def _schedule_notifications(
+        self,
+        session: AsyncSession,
+        *,
+        appointment: Appointment,
+        client: TelegramUser,
+        master: Master,
+        business: Business,
+        now: datetime,
+    ) -> None:
+        self._schedule_client_reminders(
+            session,
+            appointment=appointment,
+            client=client,
+            master=master,
+            business=business,
+            now=now,
+        )
+        self._schedule_master_notification(
+            session,
+            appointment=appointment,
+            master=master,
+            business=business,
+            kind="master_new_appointment",
+            now=now,
+        )
+
+    def _schedule_client_reminders(
         self,
         session: AsyncSession,
         *,
@@ -386,17 +651,99 @@ class BookingService:
                         state=NotificationJobState.PENDING.value,
                     )
                 )
+
+    @staticmethod
+    def _schedule_master_notification(
+        session: AsyncSession,
+        *,
+        appointment: Appointment,
+        master: Master,
+        business: Business,
+        kind: str,
+        now: datetime,
+    ) -> None:
         if master.user_id is not None:
             session.add(
                 NotificationJob(
                     business_id=business.id,
                     appointment_id=appointment.id,
                     recipient_user_id=master.user_id,
-                    kind="master_new_appointment",
+                    kind=kind,
                     scheduled_for=now,
                     state=NotificationJobState.PENDING.value,
                 )
             )
+
+    @staticmethod
+    async def _cancel_pending_notifications(
+        session: AsyncSession,
+        *,
+        appointment_id: UUID,
+    ) -> None:
+        await session.execute(
+            update(NotificationJob)
+            .where(
+                NotificationJob.appointment_id == appointment_id,
+                NotificationJob.state == NotificationJobState.PENDING.value,
+            )
+            .values(state=NotificationJobState.CANCELLED.value)
+        )
+
+    async def _get_changeable_appointment(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        client_id: UUID,
+        appointment_id: UUID,
+        now: datetime,
+    ) -> Appointment:
+        appointment = await session.scalar(
+            select(Appointment)
+            .where(
+                Appointment.id == appointment_id,
+                Appointment.business_id == business_id,
+                Appointment.client_id == client_id,
+            )
+            .with_for_update()
+        )
+        if appointment is None:
+            raise AppointmentNotFoundError
+        if not self._can_change(appointment, now):
+            raise AppointmentChangeNotAllowedError
+        return appointment
+
+    def _appointment_summary(
+        self,
+        *,
+        appointment: Appointment,
+        master: Master,
+        business: Business,
+        location: Location | None,
+        now: datetime,
+    ) -> AppointmentSummary:
+        timezone = ZoneInfo(master.timezone or business.timezone)
+        local_start = appointment.service_starts_at.astimezone(timezone)
+        return AppointmentSummary(
+            appointment_id=appointment.id,
+            service_name=appointment.service_name_snapshot,
+            master_name=master.display_name,
+            location_name=location.name if location else None,
+            local_start=local_start,
+            local_end=appointment.service_ends_at.astimezone(timezone),
+            status=appointment.status,
+            can_change=self._can_change(appointment, now),
+            change_deadline=local_start - timedelta(hours=self._settings.cancellation_cutoff_hours),
+        )
+
+    def _can_change(self, appointment: Appointment, now: datetime) -> bool:
+        return appointment.status in {
+            AppointmentStatus.PENDING_APPROVAL.value,
+            AppointmentStatus.PENDING_PAYMENT.value,
+            AppointmentStatus.CONFIRMED.value,
+        } and appointment.service_starts_at - now >= timedelta(
+            hours=self._settings.cancellation_cutoff_hours
+        )
 
     @staticmethod
     def _find_slot(

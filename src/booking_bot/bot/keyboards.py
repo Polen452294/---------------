@@ -12,6 +12,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from booking_bot.db.models import Service
 from booking_bot.domain.enums import AppointmentStatus
 from booking_bot.services.availability import BookableSlot
+from booking_bot.services.bookings import AppointmentSummary
 from booking_bot.services.master_schedule import (
     MasterAppointment,
     MasterTimeBlock,
@@ -75,16 +76,22 @@ def services_keyboard(services: list[Service]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def dates_keyboard(dates: list[date]) -> InlineKeyboardMarkup:
+def dates_keyboard(
+    dates: list[date],
+    *,
+    callback_prefix: str = "date",
+    back_callback: str = "booking:start",
+    back_text: str | None = None,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for item in dates:
         builder.button(
             text=f"{WEEKDAYS_RU[item.weekday()]}, {item:%d.%m}",
-            callback_data=f"date:{item.isoformat()}",
+            callback_data=f"{callback_prefix}:{item.isoformat()}",
         )
     builder.button(
-        text=get_specialist_template().button("back_to_services", "Назад к услугам"),
-        callback_data="booking:start",
+        text=back_text or get_specialist_template().button("back_to_services", "Назад к услугам"),
+        callback_data=back_callback,
     )
     builder.button(
         text=get_specialist_template().button("home", "В главное меню"),
@@ -94,18 +101,24 @@ def dates_keyboard(dates: list[date]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def slots_keyboard(slots: list[BookableSlot], timezone) -> InlineKeyboardMarkup:
+def slots_keyboard(
+    slots: list[BookableSlot],
+    timezone,
+    *,
+    callback_prefix: str = "slot",
+    back_callback: str = "booking:back:dates",
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for slot in slots:
         local_start = slot.service_start.astimezone(timezone)
         builder.button(
             text=local_start.strftime("%H:%M"),
-            callback_data=f"slot:{int(slot.service_start.timestamp())}",
+            callback_data=f"{callback_prefix}:{int(slot.service_start.timestamp())}",
         )
     template = get_specialist_template()
     builder.button(
         text=template.button("back_to_dates", "Назад к датам"),
-        callback_data="booking:back:dates",
+        callback_data=back_callback,
     )
     builder.button(
         text=template.button("home", "В главное меню"),
@@ -129,6 +142,96 @@ def confirmation_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text=template.button("cancel", "Отменить"),
                     callback_data="booking:abort",
+                )
+            ],
+        ]
+    )
+
+
+def client_appointments_keyboard(
+    appointments: list[AppointmentSummary],
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item in appointments:
+        builder.button(
+            text=f"{item.local_start:%d.%m %H:%M} · {item.service_name}",
+            callback_data=f"appt:v:{item.appointment_id}",
+        )
+    builder.button(
+        text=get_specialist_template().button("home", "В главное меню"),
+        callback_data="menu:home",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def client_appointment_actions_keyboard(
+    appointment: AppointmentSummary,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if appointment.can_change:
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="Перенести запись",
+                        callback_data=f"appt:r:{appointment.appointment_id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Отменить запись",
+                        callback_data=f"appt:c:{appointment.appointment_id}",
+                    )
+                ],
+            ]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="К моим записям", callback_data="booking:mine")],
+            [
+                InlineKeyboardButton(
+                    text=get_specialist_template().button("home", "В главное меню"),
+                    callback_data="menu:home",
+                )
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def client_cancel_confirmation_keyboard(appointment_id: UUID) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Да, отменить",
+                    callback_data=f"appt:cy:{appointment_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Нет, оставить запись",
+                    callback_data=f"appt:v:{appointment_id}",
+                )
+            ],
+        ]
+    )
+
+
+def reschedule_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Подтвердить перенос",
+                    callback_data="appt:rc",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Оставить прежнее время",
+                    callback_data="appt:ra",
                 )
             ],
         ]

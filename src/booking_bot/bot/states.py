@@ -7,6 +7,9 @@ class BookingStates(StatesGroup):
     selecting_slot = State()
     waiting_phone = State()
     confirming = State()
+    rescheduling_date = State()
+    rescheduling_slot = State()
+    rescheduling_confirming = State()
 
 
 class MasterStates(StatesGroup):
