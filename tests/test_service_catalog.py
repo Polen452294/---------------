@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from booking_bot.bot.handlers.master import _parse_price_minor
 from booking_bot.bot.keyboards import master_service_actions_keyboard
-from booking_bot.db.models import Business, Master, MasterService, Service
+from booking_bot.db.models import Business, Master, MasterService, Service, TelegramUser
 from booking_bot.db.session import async_session_factory
 from booking_bot.services.service_catalog import (
     DuplicateServiceNameError,
@@ -174,6 +174,15 @@ async def test_owner_service_changes_survive_template_reconfiguration() -> None:
             )
         )
         assert service is not None
+        master = await session.get(Master, deployment.master_id)
+        assert master is not None
+        if master.user_id is None:
+            owner = TelegramUser(telegram_user_id=-(uuid4().int % 2_000_000_000))
+            session.add(owner)
+            await session.flush()
+            master.user_id = owner.id
+        master.display_name = "Имя из кабинета"
+        master.bio = "Описание из кабинета"
 
         await catalog.set_duration(
             session,
@@ -187,4 +196,6 @@ async def test_owner_service_changes_survive_template_reconfiguration() -> None:
 
         assert service.duration_minutes == 95
         assert service.is_owner_managed is True
+        assert master.display_name == "Имя из кабинета"
+        assert master.bio == "Описание из кабинета"
         await session.rollback()

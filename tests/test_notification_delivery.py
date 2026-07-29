@@ -26,7 +26,21 @@ from booking_bot.services.notification_delivery import NotificationDeliveryServi
 
 
 @pytest.mark.integration
-async def test_worker_marks_job_sent_only_after_telegram_accepts_message() -> None:
+@pytest.mark.parametrize(
+    ("job_kind", "expected_text"),
+    [
+        pytest.param("client_reminder_3d", "Консультация", id="reminder"),
+        pytest.param(
+            "client_schedule_changed",
+            "Ваша запись остаётся в силе",
+            id="schedule-changed",
+        ),
+    ],
+)
+async def test_worker_marks_job_sent_only_after_telegram_accepts_message(
+    job_kind: str,
+    expected_text: str,
+) -> None:
     now = datetime(2026, 7, 23, 8, tzinfo=UTC)
     async with async_session_factory() as session:
         suffix = uuid4().hex[:12]
@@ -81,7 +95,7 @@ async def test_worker_marks_job_sent_only_after_telegram_accepts_message() -> No
             business_id=business.id,
             appointment_id=appointment.id,
             recipient_user_id=client.id,
-            kind="client_reminder_3d",
+            kind=job_kind,
             scheduled_for=now - timedelta(seconds=1),
         )
         session.add(job)
@@ -96,6 +110,7 @@ async def test_worker_marks_job_sent_only_after_telegram_accepts_message() -> No
     )
     assert processed == 1
     bot.send_message.assert_awaited_once()
+    assert expected_text in bot.send_message.await_args.kwargs["text"]
 
     async with async_session_factory() as session:
         delivered = await session.get(NotificationJob, job_id)

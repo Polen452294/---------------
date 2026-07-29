@@ -6,6 +6,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
@@ -408,6 +409,29 @@ def _format_manual_confirmation(
         f"Телефон: <code>{escape(client_phone)}</code>"
         f"{comment}\n\n"
         "Клиент добавлен вручную, поэтому Telegram-напоминания ему не отправляются."
+    )
+
+
+@router.message(Command("cabinet"))
+async def master_cabinet_command(
+    message: Message,
+    state: FSMContext,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(message.from_user, db_session, business_id)
+    if context is None:
+        await message.answer(
+            "Кабинет доступен только привязанному специалисту.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    _user, master = context
+    await _release_manual_hold(state, db_session)
+    await state.clear()
+    await message.answer(
+        f"Мой кабинет — <b>{escape(master.display_name)}</b>:",
+        reply_markup=master_menu_keyboard(),
     )
 
 

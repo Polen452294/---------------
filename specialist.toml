@@ -13,15 +13,15 @@ name = "Студия"
 address = "Москва, укажите адрес"
 
 [texts]
-welcome = "Здравствуйте! Я — Анна, тату-мастер. Здесь можно посмотреть услуги и записаться на свободное время."
+welcome = "Здравствуйте! Я — {specialist_name}. {specialist_bio}\n\nЗдесь можно посмотреть услуги и записаться на свободное время."
 help = "Выберите услугу, дату и свободное время. Выбранное окно удерживается 10 минут до подтверждения."
 booking_intro = "Выберите услугу:"
 booking_success = "Запись создана! Я получу уведомление и свяжусь с вами при необходимости."
 no_upcoming_bookings = "У вас пока нет предстоящих записей."
-reminder_title = "⏰ <b>Напоминание о записи к Анне</b>"
-appointment_confirmed = "✅ <b>Анна подтвердила запись</b>"
-appointment_cancelled = "Анна отменила запись."
-appointment_rescheduled = "🔄 <b>Анна перенесла запись</b>"
+reminder_title = "⏰ <b>Напоминание о записи к {specialist_name}</b>"
+appointment_confirmed = "✅ <b>{specialist_name} подтвердил(а) запись</b>"
+appointment_cancelled = "{specialist_name} отменил(а) запись."
+appointment_rescheduled = "🔄 <b>{specialist_name} перенёс(ла) запись</b>"
 
 [buttons]
 book = "Записаться"

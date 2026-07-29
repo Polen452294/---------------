@@ -413,6 +413,7 @@ class MasterScheduleService:
         weekday: int,
         start_time: time | None,
         end_time: time | None,
+        now: datetime | None = None,
     ) -> None:
         if weekday not in range(7):
             raise ValueError("weekday must be between 0 and 6")
@@ -420,6 +421,26 @@ class MasterScheduleService:
             raise ValueError("start_time and end_time must both be provided")
         if start_time is not None and end_time is not None and end_time <= start_time:
             raise ValueError("end_time must be after start_time")
+
+        existing_rules = list(
+            (
+                await session.scalars(
+                    select(WorkingRule).where(
+                        WorkingRule.business_id == business_id,
+                        WorkingRule.master_id == master_id,
+                        WorkingRule.weekday == weekday,
+                        WorkingRule.is_active.is_(True),
+                    )
+                )
+            ).all()
+        )
+        old_intervals = {(rule.start_time, rule.end_time) for rule in existing_rules}
+        new_intervals = (
+            {(start_time, end_time)}
+            if start_time is not None and end_time is not None
+            else set()
+        )
+        schedule_changed = old_intervals != new_intervals
 
         await session.execute(
             delete(WorkingRule).where(
@@ -449,6 +470,97 @@ class MasterScheduleService:
                 )
             )
         await session.flush()
+        if schedule_changed:
+            await self._enqueue_schedule_change_notifications(
+                session,
+                business_id=business_id,
+                master_id=master_id,
+                affected_weekdays={weekday},
+                change_kind="weekly_hours",
+                now=now,
+            )
+
+    async def replace_weekly_schedule(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        master_id: UUID,
+        schedule: dict[int, tuple[time, time]],
+        now: datetime | None = None,
+    ) -> None:
+        if not schedule:
+            raise ValueError("schedule must contain at least one working day")
+        for weekday, (start_time, end_time) in schedule.items():
+            if weekday not in range(7):
+                raise ValueError("weekday must be between 0 and 6")
+            if end_time <= start_time:
+                raise ValueError("end_time must be after start_time")
+
+        existing_rules = list(
+            (
+                await session.scalars(
+                    select(WorkingRule).where(
+                        WorkingRule.business_id == business_id,
+                        WorkingRule.master_id == master_id,
+                        WorkingRule.is_active.is_(True),
+                    )
+                )
+            ).all()
+        )
+        old_schedule: dict[int, set[tuple[time, time]]] = {}
+        for rule in existing_rules:
+            old_schedule.setdefault(rule.weekday, set()).add(
+                (rule.start_time, rule.end_time)
+            )
+        new_schedule = {
+            weekday: {(start_time, end_time)}
+            for weekday, (start_time, end_time) in schedule.items()
+        }
+        changed_weekdays = {
+            weekday
+            for weekday in range(7)
+            if old_schedule.get(weekday, set()) != new_schedule.get(weekday, set())
+        }
+
+        location_id = await session.scalar(
+            select(Location.id)
+            .where(
+                Location.business_id == business_id,
+                Location.is_active.is_(True),
+            )
+            .order_by(Location.created_at)
+            .limit(1)
+        )
+        await session.execute(
+            delete(WorkingRule).where(
+                WorkingRule.business_id == business_id,
+                WorkingRule.master_id == master_id,
+            )
+        )
+        session.add_all(
+            [
+                WorkingRule(
+                    business_id=business_id,
+                    master_id=master_id,
+                    location_id=location_id,
+                    weekday=weekday,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                for weekday, (start_time, end_time) in sorted(schedule.items())
+            ]
+        )
+        await session.flush()
+        if changed_weekdays:
+            await self._enqueue_schedule_change_notifications(
+                session,
+                business_id=business_id,
+                master_id=master_id,
+                affected_weekdays=changed_weekdays,
+                change_kind="weekly_schedule",
+                now=now,
+            )
 
     async def toggle_day_off(
         self,
@@ -457,6 +569,7 @@ class MasterScheduleService:
         business_id: UUID,
         master_id: UUID,
         local_date: date,
+        now: datetime | None = None,
     ) -> bool:
         existing = list(
             (
@@ -474,6 +587,14 @@ class MasterScheduleService:
             for item in existing:
                 await session.delete(item)
             await session.flush()
+            await self._enqueue_schedule_change_notifications(
+                session,
+                business_id=business_id,
+                master_id=master_id,
+                affected_dates={local_date},
+                change_kind="day_off_removed",
+                now=now,
+            )
             return False
         session.add(
             ScheduleException(
@@ -484,6 +605,14 @@ class MasterScheduleService:
             )
         )
         await session.flush()
+        await self._enqueue_schedule_change_notifications(
+            session,
+            business_id=business_id,
+            master_id=master_id,
+            affected_dates={local_date},
+            change_kind="day_off_added",
+            now=now,
+        )
         return True
 
     async def list_day_off_dates(
@@ -519,9 +648,33 @@ class MasterScheduleService:
         local_date: date,
         start_time: time,
         end_time: time,
+        now: datetime | None = None,
     ) -> None:
         if end_time <= start_time:
             raise ValueError("end_time must be after start_time")
+        existing = list(
+            (
+                await session.scalars(
+                    select(ScheduleException).where(
+                        ScheduleException.business_id == business_id,
+                        ScheduleException.master_id == master_id,
+                        ScheduleException.exception_date == local_date,
+                        ScheduleException.kind.in_(
+                            [
+                                ScheduleExceptionKind.DAY_OFF.value,
+                                ScheduleExceptionKind.EXTRA_DAY.value,
+                            ]
+                        ),
+                    )
+                )
+            ).all()
+        )
+        schedule_changed = not (
+            len(existing) == 1
+            and existing[0].kind == ScheduleExceptionKind.EXTRA_DAY.value
+            and existing[0].start_time == start_time
+            and existing[0].end_time == end_time
+        )
         await session.execute(
             delete(ScheduleException).where(
                 ScheduleException.business_id == business_id,
@@ -556,6 +709,119 @@ class MasterScheduleService:
             )
         )
         await session.flush()
+        if schedule_changed:
+            await self._enqueue_schedule_change_notifications(
+                session,
+                business_id=business_id,
+                master_id=master_id,
+                affected_dates={local_date},
+                change_kind="extra_day",
+                now=now,
+            )
+
+    async def _enqueue_schedule_change_notifications(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        master_id: UUID,
+        change_kind: str,
+        affected_weekdays: set[int] | None = None,
+        affected_dates: set[date] | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        affected_weekdays = affected_weekdays or set()
+        affected_dates = affected_dates or set()
+        if not affected_weekdays and not affected_dates:
+            return 0
+
+        now = now or datetime.now(UTC)
+        business = await session.get(Business, business_id)
+        master = await session.get(Master, master_id)
+        if business is None or master is None:
+            raise MasterScheduleError("Business or master not found")
+        timezone = ZoneInfo(master.timezone or business.timezone)
+        active_statuses = {
+            AppointmentStatus.PENDING_APPROVAL.value,
+            AppointmentStatus.PENDING_PAYMENT.value,
+            AppointmentStatus.CONFIRMED.value,
+        }
+        appointments = list(
+            (
+                await session.scalars(
+                    select(Appointment)
+                    .join(
+                        CalendarEntry,
+                        CalendarEntry.id == Appointment.calendar_entry_id,
+                    )
+                    .join(
+                        TelegramUser,
+                        TelegramUser.id == Appointment.client_id,
+                    )
+                    .where(
+                        Appointment.business_id == business_id,
+                        Appointment.status.in_(active_statuses),
+                        Appointment.service_starts_at > now,
+                        CalendarEntry.master_id == master_id,
+                        CalendarEntry.state == CalendarEntryState.ACTIVE.value,
+                        TelegramUser.telegram_user_id.is_not(None),
+                    )
+                )
+            ).all()
+        )
+        affected_appointments = []
+        for appointment in appointments:
+            appointment_date = appointment.service_starts_at.astimezone(timezone).date()
+            if (
+                appointment_date in affected_dates
+                or appointment_date.weekday() in affected_weekdays
+            ):
+                affected_appointments.append(appointment)
+        if not affected_appointments:
+            return 0
+
+        appointment_ids = [appointment.id for appointment in affected_appointments]
+        existing_jobs = list(
+            (
+                await session.scalars(
+                    select(NotificationJob).where(
+                        NotificationJob.appointment_id.in_(appointment_ids),
+                        NotificationJob.kind == "client_schedule_changed",
+                        NotificationJob.state.in_(
+                            {
+                                NotificationJobState.PENDING.value,
+                                NotificationJobState.PROCESSING.value,
+                            }
+                        ),
+                    )
+                )
+            ).all()
+        )
+        jobs_by_appointment = {job.appointment_id: job for job in existing_jobs}
+        queued = 0
+        for appointment in affected_appointments:
+            existing_job = jobs_by_appointment.get(appointment.id)
+            if existing_job is not None:
+                if existing_job.state == NotificationJobState.PENDING.value:
+                    payload = dict(existing_job.payload or {})
+                    change_kinds = set(payload.get("change_kinds", []))
+                    change_kinds.add(change_kind)
+                    existing_job.payload = {"change_kinds": sorted(change_kinds)}
+                continue
+            session.add(
+                NotificationJob(
+                    business_id=business_id,
+                    appointment_id=appointment.id,
+                    recipient_user_id=appointment.client_id,
+                    kind="client_schedule_changed",
+                    scheduled_for=now,
+                    state=NotificationJobState.PENDING.value,
+                    payload={"change_kinds": [change_kind]},
+                )
+            )
+            queued += 1
+        await session.flush()
+        return queued
 
     async def create_time_block(
         self,

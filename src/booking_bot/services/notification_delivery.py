@@ -193,7 +193,8 @@ class NotificationDeliveryService:
 
     async def _is_enabled(self, session: AsyncSession, job: NotificationJob) -> bool:
         if job.appointment_id is not None and (
-            job.kind.startswith("client_reminder_") or job.kind == "master_new_appointment"
+            job.kind.startswith("client_reminder_")
+            or job.kind in {"master_new_appointment", "client_schedule_changed"}
         ):
             appointment = await session.get(Appointment, job.appointment_id)
             if appointment is None or appointment.status in {
@@ -293,6 +294,7 @@ class NotificationDeliveryService:
                 get_specialist_template().text(
                     "reminder_title",
                     "⏰ <b>Напоминание о записи</b>",
+                    specialist_name=escape(master.display_name),
                 )
                 + "\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
@@ -304,6 +306,7 @@ class NotificationDeliveryService:
                 get_specialist_template().text(
                     "appointment_cancelled",
                     "Запись отменена специалистом.",
+                    specialist_name=escape(master.display_name),
                 )
                 + "\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
@@ -315,6 +318,7 @@ class NotificationDeliveryService:
                 get_specialist_template().text(
                     "appointment_confirmed",
                     "✅ <b>Запись подтверждена</b>",
+                    specialist_name=escape(master.display_name),
                 )
                 + "\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
@@ -326,12 +330,24 @@ class NotificationDeliveryService:
                 get_specialist_template().text(
                     "appointment_rescheduled",
                     "🔄 <b>Специалист перенёс запись</b>",
+                    specialist_name=escape(master.display_name),
                 )
                 + "\n\n"
                 f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
                 f"Новое время: <b>{local_start:%d.%m.%Y %H:%M}</b>"
                 f"{location_text}\n\n"
                 "Если новое время не подходит, свяжитесь со специалистом."
+            )
+        elif job.kind == "client_schedule_changed":
+            text = (
+                "🗓 <b>Изменилось расписание специалиста</b>\n\n"
+                f"У специалиста <b>{escape(master.display_name)}</b> изменился рабочий график.\n"
+                "Ваша запись остаётся в силе:\n\n"
+                f"Услуга: <b>{escape(appointment.service_name_snapshot)}</b>\n"
+                f"Дата и время: <b>{local_start:%d.%m.%Y %H:%M}</b>"
+                f"{location_text}\n\n"
+                "Если время записи изменится или запись будет отменена, "
+                "вы получите отдельное уведомление."
             )
         else:
             raise UnsupportedNotificationError(f"Unsupported notification kind: {job.kind}")

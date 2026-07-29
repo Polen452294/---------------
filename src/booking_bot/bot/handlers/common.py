@@ -1,3 +1,4 @@
+from html import escape
 from uuid import UUID
 
 from aiogram import Router
@@ -6,7 +7,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from booking_bot.bot.keyboards import main_menu_keyboard, master_menu_keyboard
+from booking_bot.bot.commands import set_master_commands
+from booking_bot.bot.handlers.specialist_setup import begin_specialist_onboarding
+from booking_bot.bot.keyboards import main_menu_keyboard
 from booking_bot.config import get_settings
 from booking_bot.services.bookings import BookingService
 from booking_bot.services.master_access import (
@@ -15,6 +18,7 @@ from booking_bot.services.master_access import (
     get_master_for_user,
     redeem_master_invite,
 )
+from booking_bot.services.specialist_context import get_specialist_context
 from booking_bot.services.users import get_or_create_telegram_user
 from booking_bot.specialist_config import get_specialist_template
 
@@ -66,23 +70,30 @@ async def start_handler(
                 reply_markup=main_menu_keyboard(),
             )
             return
-        await message.answer(
-            f"Профиль специалиста <b>{master.display_name}</b> успешно привязан.",
-            reply_markup=master_menu_keyboard(),
+        await set_master_commands(message.bot, chat_id=message.chat.id)
+        await begin_specialist_onboarding(
+            message,
+            state,
+            db_session,
+            business_id=business_id,
+            master=master,
         )
         return
 
-    master = await get_master_for_user(
+    actor_master = await get_master_for_user(
         db_session,
         business_id=business_id,
         user_id=user.id,
     )
+    specialist = (await get_specialist_context(db_session)).master
     await message.answer(
         get_specialist_template().text(
             "welcome",
             "Здравствуйте! Здесь можно выбрать услугу, дату и свободное время.",
+            specialist_name=escape(specialist.display_name),
+            specialist_bio=escape(specialist.bio or ""),
         ),
-        reply_markup=main_menu_keyboard(master_access=master is not None),
+        reply_markup=main_menu_keyboard(master_access=actor_master is not None),
     )
 
 

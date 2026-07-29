@@ -14,6 +14,12 @@ def test_specialist_template_contains_single_owner_catalog() -> None:
     assert template.profile.brand_name == "Anna Tattoo"
     assert len(template.services) == 2
     assert len({service.key for service in template.services}) == len(template.services)
+    assert "Мария" in template.text(
+        "welcome",
+        "",
+        specialist_name="Мария",
+        specialist_bio="Косметолог",
+    )
 
 
 def test_client_keyboards_do_not_offer_master_selection() -> None:

@@ -370,6 +370,12 @@ def master_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="⚙️ Профиль и расписание",
+                    callback_data="setup:profile:start",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="Клиентское меню",
                     callback_data="master:client-menu",
                 )
@@ -675,6 +681,12 @@ def master_availability_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="Перенастроить всю неделю",
+                    callback_data="setup:schedule:start",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="Выходные",
                     callback_data="master:days-off",
                 ),
@@ -696,6 +708,58 @@ def master_availability_keyboard() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton(text="Назад", callback_data="master:menu")],
+        ]
+    )
+
+
+def specialist_setup_bio_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Оставить текущее", callback_data="setup:bio:skip")],
+            [InlineKeyboardButton(text="Отмена", callback_data="setup:cancel")],
+        ]
+    )
+
+
+def specialist_setup_days_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
+    day_buttons = [
+        InlineKeyboardButton(
+            text=f"{'✅ ' if weekday in selected else ''}{name}",
+            callback_data=f"setup:day:{weekday}",
+        )
+        for weekday, name in enumerate(WEEKDAYS_RU)
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            day_buttons[0:2],
+            day_buttons[2:4],
+            day_buttons[4:6],
+            day_buttons[6:7],
+            [
+                InlineKeyboardButton(text="Пн–Пт", callback_data="setup:preset:weekdays"),
+                InlineKeyboardButton(text="Каждый день", callback_data="setup:preset:all"),
+            ],
+            [InlineKeyboardButton(text="Очистить", callback_data="setup:preset:clear")],
+            [InlineKeyboardButton(text="Продолжить", callback_data="setup:days:done")],
+            [InlineKeyboardButton(text="Отмена", callback_data="setup:cancel")],
+        ]
+    )
+
+
+def specialist_setup_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Отмена", callback_data="setup:cancel")],
+        ]
+    )
+
+
+def specialist_setup_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Сохранить", callback_data="setup:save")],
+            [InlineKeyboardButton(text="Изменить дни", callback_data="setup:days:change")],
+            [InlineKeyboardButton(text="Отмена", callback_data="setup:cancel")],
         ]
     )
 

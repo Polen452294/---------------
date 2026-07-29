@@ -35,3 +35,11 @@ class MasterStates(StatesGroup):
     rescheduling_slot = State()
     rescheduling_confirming = State()
     waiting_reminder_hour = State()
+
+
+class SpecialistSetupStates(StatesGroup):
+    waiting_name = State()
+    waiting_bio = State()
+    selecting_days = State()
+    waiting_day_hours = State()
+    confirming = State()

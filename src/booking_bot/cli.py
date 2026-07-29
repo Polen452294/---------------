@@ -2,11 +2,11 @@ import argparse
 import asyncio
 import logging
 
-from aiogram.types import BotCommand
-
 from booking_bot.bot import dispatcher
+from booking_bot.bot.commands import set_client_commands, set_master_commands
 from booking_bot.bot.factory import create_telegram_bot
 from booking_bot.config import get_settings
+from booking_bot.db.models import TelegramUser
 from booking_bot.db.session import async_session_factory, engine
 from booking_bot.services.master_access import create_master_invite
 from booking_bot.services.notification_delivery import NotificationDeliveryService
@@ -40,17 +40,19 @@ async def run_polling(_: argparse.Namespace) -> None:
 
     async with async_session_factory() as session:
         context = await get_specialist_context(session)
+        master_user = (
+            await session.get(TelegramUser, context.master.user_id)
+            if context.master.user_id is not None
+            else None
+        )
 
     bot = create_telegram_bot(settings.telegram_bot_token.get_secret_value(), settings)
     try:
         bot_info = await bot.get_me()
         await bot.delete_webhook(drop_pending_updates=False)
-        await bot.set_my_commands(
-            [
-                BotCommand(command="start", description="Открыть меню записи"),
-                BotCommand(command="help", description="Помощь"),
-            ]
-        )
+        await set_client_commands(bot)
+        if master_user is not None and master_user.telegram_user_id is not None:
+            await set_master_commands(bot, chat_id=master_user.telegram_user_id)
         print(
             f"Polling started for @{bot_info.username} "
             f"(specialist: {template.profile.specialist_name})",

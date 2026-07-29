@@ -70,8 +70,9 @@ async def configure_specialist(
     business.currency = template.profile.currency
     business.is_active = True
     master.business_id = business.id
-    master.display_name = template.profile.specialist_name
-    master.bio = template.profile.bio
+    if master.user_id is None:
+        master.display_name = template.profile.specialist_name
+        master.bio = template.profile.bio
     master.timezone = template.profile.timezone
     master.is_active = True
 

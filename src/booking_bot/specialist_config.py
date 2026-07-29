@@ -55,6 +55,7 @@ class SpecialistTemplate:
             "brand_name": self.profile.brand_name,
             "specialist_name": self.profile.specialist_name,
             "specialist_role": self.profile.specialist_role,
+            "specialist_bio": self.profile.bio,
             **values,
         }
         return template.format_map(context)
