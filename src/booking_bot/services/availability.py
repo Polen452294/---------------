@@ -243,6 +243,35 @@ class AvailabilityService:
 
         return sorted(found.values(), key=lambda item: item.service_start)
 
+    async def list_available_dates(
+        self,
+        session: AsyncSession,
+        *,
+        business_id: UUID,
+        master_id: UUID,
+        service_id: UUID,
+        local_dates: list[date],
+        now: datetime | None = None,
+        respect_min_lead_time: bool = True,
+        duration_minutes_override: int | None = None,
+    ) -> list[date]:
+        now = now or datetime.now(UTC)
+        available_dates: list[date] = []
+        for local_date in local_dates:
+            slots = await self.list_slots(
+                session,
+                business_id=business_id,
+                master_id=master_id,
+                service_id=service_id,
+                local_date=local_date,
+                now=now,
+                respect_min_lead_time=respect_min_lead_time,
+                duration_minutes_override=duration_minutes_override,
+            )
+            if slots:
+                available_dates.append(local_date)
+        return available_dates
+
     @staticmethod
     def _exception_windows(
         exceptions: list[ScheduleException],

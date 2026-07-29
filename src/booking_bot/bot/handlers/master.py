@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,7 @@ from booking_bot.bot.keyboards import (
     master_manual_services_keyboard,
     master_manual_slots_keyboard,
     master_menu_keyboard,
+    master_month_schedule_keyboard,
     master_notifications_keyboard,
     master_reschedule_confirmation_keyboard,
     master_schedule_dates_keyboard,
@@ -53,6 +54,7 @@ from booking_bot.services.analytics import (
     MasterAnalyticsService,
     build_analytics_period,
 )
+from booking_bot.services.appointment_export import build_appointments_xlsx
 from booking_bot.services.availability import AvailabilityService, BookingConfigurationError
 from booking_bot.services.bookings import (
     AppointmentChangeNotAllowedError,
@@ -102,11 +104,20 @@ analytics_service = MasterAnalyticsService()
 
 STATUS_LABELS = {
     AppointmentStatus.PENDING_APPROVAL.value: "ожидает подтверждения",
+    AppointmentStatus.PENDING_PAYMENT.value: "ожидает оплаты",
     AppointmentStatus.CONFIRMED.value: "подтверждена",
     AppointmentStatus.COMPLETED.value: "выполнена",
     AppointmentStatus.NO_SHOW.value: "клиент не пришёл",
     AppointmentStatus.CANCELLED_BY_MASTER.value: "отменена специалистом",
     AppointmentStatus.CANCELLED_BY_CLIENT.value: "отменена клиентом",
+}
+MONTH_APPOINTMENTS_PAGE_SIZE = 18
+MONTH_STATUS_LABELS = {
+    AppointmentStatus.PENDING_APPROVAL.value: "ожид.",
+    AppointmentStatus.PENDING_PAYMENT.value: "оплата",
+    AppointmentStatus.CONFIRMED.value: "подтв.",
+    AppointmentStatus.COMPLETED.value: "готово",
+    AppointmentStatus.NO_SHOW.value: "неявка",
 }
 STATUS_ACTIONS = {
     "approve": AppointmentStatus.CONFIRMED.value,
@@ -174,6 +185,49 @@ def _format_appointment(item: MasterAppointment) -> str:
         f"Статус: <b>{STATUS_LABELS.get(item.status, escape(item.status))}</b>"
         f"{location}{comment}{internal_note}"
     )
+
+
+def _table_cell(value: str | None, width: int) -> str:
+    normalized = " ".join((value or "—").split())
+    if len(normalized) > width:
+        normalized = normalized[: width - 1] + "…"
+    return normalized.ljust(width)
+
+
+def _format_month_appointments_table(
+    appointments: list[MasterAppointment],
+    *,
+    period_start: date,
+    period_end: date,
+    page: int,
+    page_size: int = MONTH_APPOINTMENTS_PAGE_SIZE,
+) -> tuple[str, int, int]:
+    page_count = max(1, (len(appointments) + page_size - 1) // page_size)
+    page = min(max(page, 0), page_count - 1)
+    start_index = page * page_size
+    page_items = appointments[start_index : start_index + page_size]
+    lines = [
+        " № Дата  Время Клиент       Услуга         Статус",
+        "── ───── ───── ──────────── ────────────── ──────",
+    ]
+    for index, item in enumerate(page_items, start_index + 1):
+        lines.append(
+            f"{index:>2} {item.local_start:%d.%m} {item.local_start:%H:%M} "
+            f"{_table_cell(item.client_name, 12)} "
+            f"{_table_cell(item.service_name, 14)} "
+            f"{_table_cell(MONTH_STATUS_LABELS.get(item.status, item.status), 6)}"
+        )
+    table = escape("\n".join(lines))
+    text = (
+        "<b>Записи на ближайшие 30 дней</b>\n"
+        f"Период: <b>{period_start:%d.%m.%Y}–{period_end:%d.%m.%Y}</b>\n"
+        f"Всего записей: <b>{len(appointments)}</b>"
+    )
+    if appointments:
+        text += f"\nСтраница: <b>{page + 1}/{page_count}</b>\n\n<pre>{table}</pre>"
+    else:
+        text += "\n\nЗаписей нет."
+    return text, page, page_count
 
 
 def _format_price(service: Service) -> str:
@@ -1272,6 +1326,95 @@ async def master_manual_abort(
         reply_markup=master_menu_keyboard(),
     )
     await callback.answer("Создание записи отменено")
+
+
+@router.callback_query(F.data == "master:month:export")
+async def master_month_export(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    message = callback.message if isinstance(callback.message, Message) else None
+    if message is None:
+        await callback.answer("Не удалось отправить файл", show_alert=True)
+        return
+
+    timezone = await _master_timezone(db_session, business_id, master)
+    period_start = datetime.now(UTC).astimezone(timezone).date()
+    period_end = period_start + timedelta(days=29)
+    appointments = await schedule_service.list_appointments(
+        db_session,
+        business_id=business_id,
+        master=master,
+        start_date=period_start,
+        days=30,
+    )
+    document = BufferedInputFile(
+        build_appointments_xlsx(
+            appointments,
+            specialist_name=master.display_name,
+            period_start=period_start,
+            period_end=period_end,
+        ),
+        filename=f"appointments-{period_start:%Y-%m-%d}-{period_end:%Y-%m-%d}.xlsx",
+    )
+    await message.answer_document(
+        document,
+        caption=(
+            f"Записи на период {period_start:%d.%m.%Y}–{period_end:%d.%m.%Y}. "
+            f"Всего: {len(appointments)}."
+        ),
+    )
+    await callback.answer("Excel-файл готов")
+
+
+@router.callback_query(F.data.startswith("master:month:page:"))
+async def master_month_schedule(
+    callback: CallbackQuery,
+    db_session: AsyncSession,
+    business_id: UUID,
+) -> None:
+    context = await _master_for_actor(callback.from_user, db_session, business_id)
+    if context is None:
+        await _deny(callback)
+        return
+    _user, master = context
+    try:
+        requested_page = int((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("Некорректная страница", show_alert=True)
+        return
+
+    timezone = await _master_timezone(db_session, business_id, master)
+    period_start = datetime.now(UTC).astimezone(timezone).date()
+    period_end = period_start + timedelta(days=29)
+    appointments = await schedule_service.list_appointments(
+        db_session,
+        business_id=business_id,
+        master=master,
+        start_date=period_start,
+        days=30,
+    )
+    text, page, page_count = _format_month_appointments_table(
+        appointments,
+        period_start=period_start,
+        period_end=period_end,
+        page=requested_page,
+    )
+    await _edit(
+        callback,
+        text,
+        reply_markup=master_month_schedule_keyboard(
+            page=page,
+            page_count=page_count,
+        ),
+    )
+    await callback.answer()
 
 
 @router.callback_query(

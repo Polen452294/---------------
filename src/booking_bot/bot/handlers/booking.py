@@ -192,6 +192,7 @@ async def _show_dates(
 ) -> None:
     data = await state.get_data()
     master_id = UUID(data["master_id"])
+    service_id = UUID(data["service_id"])
     master = await session.get(Master, master_id)
     business = await session.get(Business, business_id)
     if master is None or business is None:
@@ -199,11 +200,24 @@ async def _show_dates(
         return
     timezone = ZoneInfo(master.timezone or business.timezone)
     today = datetime.now(UTC).astimezone(timezone).date()
-    dates = [today + timedelta(days=offset) for offset in range(_settings().booking_dates_shown)]
+    candidate_dates = [
+        today + timedelta(days=offset) for offset in range(_settings().booking_dates_shown)
+    ]
+    dates = await AvailabilityService(_settings()).list_available_dates(
+        session,
+        business_id=business_id,
+        master_id=master_id,
+        service_id=service_id,
+        local_dates=candidate_dates,
+    )
     await state.set_state(BookingStates.selecting_date)
     await _edit_or_answer(
         callback,
-        "Выберите дату:",
+        (
+            "Выберите дату:"
+            if dates
+            else "В ближайшие дни свободных окон нет. Попробуйте проверить расписание позже."
+        ),
         reply_markup=dates_keyboard(dates),
     )
     await callback.answer()
@@ -218,6 +232,7 @@ async def _show_reschedule_dates(
     data = await state.get_data()
     try:
         master_id = UUID(data["master_id"])
+        service_id = UUID(data["service_id"])
         appointment_id = UUID(data["appointment_id"])
     except (KeyError, ValueError):
         await state.clear()
@@ -230,11 +245,24 @@ async def _show_reschedule_dates(
         return
     timezone = ZoneInfo(master.timezone or business.timezone)
     today = datetime.now(UTC).astimezone(timezone).date()
-    dates = [today + timedelta(days=offset) for offset in range(_settings().booking_dates_shown)]
+    candidate_dates = [
+        today + timedelta(days=offset) for offset in range(_settings().booking_dates_shown)
+    ]
+    dates = await AvailabilityService(_settings()).list_available_dates(
+        session,
+        business_id=business_id,
+        master_id=master_id,
+        service_id=service_id,
+        local_dates=candidate_dates,
+    )
     await state.set_state(BookingStates.rescheduling_date)
     await _edit_or_answer(
         callback,
-        "Выберите новую дату:",
+        (
+            "Выберите новую дату:"
+            if dates
+            else "В ближайшие дни нет свободных окон для переноса."
+        ),
         reply_markup=dates_keyboard(
             dates,
             callback_prefix="rdate",
@@ -398,15 +426,21 @@ async def select_date(
     await state.update_data(local_date=local_date.isoformat())
     if not slots:
         await state.set_state(BookingStates.selecting_date)
+        candidate_dates = [
+            datetime.now(UTC).astimezone(timezone).date() + timedelta(days=offset)
+            for offset in range(_settings().booking_dates_shown)
+        ]
+        available_dates = await AvailabilityService(_settings()).list_available_dates(
+            db_session,
+            business_id=business_id,
+            master_id=master_id,
+            service_id=service_id,
+            local_dates=candidate_dates,
+        )
         await _edit_or_answer(
             callback,
             "На эту дату свободных окон нет. Выберите другую дату:",
-            reply_markup=dates_keyboard(
-                [
-                    datetime.now(UTC).astimezone(timezone).date() + timedelta(days=offset)
-                    for offset in range(_settings().booking_dates_shown)
-                ]
-            ),
+            reply_markup=dates_keyboard(available_dates),
         )
     else:
         await state.set_state(BookingStates.selecting_slot)

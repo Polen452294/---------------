@@ -331,7 +331,10 @@ def master_menu_keyboard() -> InlineKeyboardMarkup:
                     callback_data="master:schedule:tomorrow",
                 ),
             ],
-            [InlineKeyboardButton(text="Неделя", callback_data="master:schedule:week")],
+            [
+                InlineKeyboardButton(text="Неделя", callback_data="master:schedule:week"),
+                InlineKeyboardButton(text="30 дней", callback_data="master:month:page:0"),
+            ],
             [
                 InlineKeyboardButton(
                     text="Выбрать дату",
@@ -571,6 +574,48 @@ def master_appointments_keyboard(
     )
     builder.adjust(1)
     return builder.as_markup()
+
+
+def master_month_schedule_keyboard(
+    *,
+    page: int,
+    page_count: int,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="← Назад",
+                callback_data=f"master:month:page:{page - 1}",
+            )
+        )
+    if page + 1 < page_count:
+        navigation.append(
+            InlineKeyboardButton(
+                text="Вперёд →",
+                callback_data=f"master:month:page:{page + 1}",
+            )
+        )
+    if navigation:
+        rows.append(navigation)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="📥 Скачать Excel",
+                callback_data="master:month:export",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=get_specialist_template().button("specialist_cabinet", "Мой кабинет"),
+                callback_data="master:menu",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def master_schedule_dates_keyboard(dates: list[date]) -> InlineKeyboardMarkup:

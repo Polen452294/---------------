@@ -196,12 +196,22 @@ async def test_full_schedule_replacement_recalculates_slots_and_preserves_appoin
             now=now,
             respect_min_lead_time=False,
         )
+        available_dates = await availability.list_available_dates(
+            session,
+            business_id=business.id,
+            master_id=master.id,
+            service_id=service.id,
+            local_dates=[old_workday, new_workday],
+            now=now,
+            respect_min_lead_time=False,
+        )
 
         assert [(rule.weekday, rule.start_time, rule.end_time) for rule in rules] == [
             (1, time(12), time(18))
         ]
         assert old_slots == []
         assert new_slots[0].service_start == datetime(2026, 8, 4, 12, tzinfo=UTC)
+        assert available_dates == [new_workday]
         assert await session.get(Appointment, appointment.id) is appointment
         assert entry.state == CalendarEntryState.ACTIVE.value
 
