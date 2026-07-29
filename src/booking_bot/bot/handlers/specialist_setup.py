@@ -14,6 +14,7 @@ from booking_bot.bot.keyboards import (
     specialist_setup_cancel_keyboard,
     specialist_setup_confirmation_keyboard,
     specialist_setup_days_keyboard,
+    specialist_setup_hours_keyboard,
 )
 from booking_bot.bot.states import SpecialistSetupStates
 from booking_bot.db.models import Master
@@ -134,6 +135,20 @@ def _schedule_summary(data: dict) -> str:
         "<b>Недельное расписание:</b>\n"
         + "\n".join(lines)
         + "\n\nПосле сохранения новые свободные окна будут рассчитаны по этому графику."
+    )
+
+
+def _working_hours_prompt(weekday: int, *, can_apply_to_all: bool) -> str:
+    reuse_hint = (
+        "\nЕсли график одинаковый во все выбранные дни, нажмите кнопку ниже."
+        if can_apply_to_all
+        else "\nПосле первого интервала его можно будет применить ко всем рабочим дням."
+    )
+    return (
+        f"Во сколько вы работаете в <b>{WEEKDAY_NAMES[weekday]}</b>?\n"
+        "Отправьте интервал в формате <code>10:00-19:00</code>."
+        f"{reuse_hint}\n\n"
+        "Время можно будет изменить позже в кабинете специалиста."
     )
 
 
@@ -325,9 +340,8 @@ async def finish_setup_days(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SpecialistSetupStates.waiting_day_hours)
     await _edit_callback(
         callback,
-        f"Во сколько вы работаете в <b>{WEEKDAY_NAMES[selected[0]]}</b>?\n"
-        "Отправьте интервал в формате <code>10:00-19:00</code>.",
-        reply_markup=specialist_setup_cancel_keyboard(),
+        _working_hours_prompt(selected[0], can_apply_to_all=False),
+        reply_markup=specialist_setup_hours_keyboard(),
     )
     await callback.answer()
 
@@ -366,9 +380,8 @@ async def receive_setup_day_hours(message: Message, state: FSMContext) -> None:
     await state.update_data(schedule_intervals=intervals, schedule_index=index)
     if index < len(selected):
         await message.answer(
-            f"Во сколько вы работаете в <b>{WEEKDAY_NAMES[selected[index]]}</b>?\n"
-            "Отправьте интервал в формате <code>10:00-19:00</code>.",
-            reply_markup=specialist_setup_cancel_keyboard(),
+            _working_hours_prompt(selected[index], can_apply_to_all=True),
+            reply_markup=specialist_setup_hours_keyboard(source_weekday=weekday),
         )
         return
 
@@ -377,6 +390,44 @@ async def receive_setup_day_hours(message: Message, state: FSMContext) -> None:
         _schedule_summary(await state.get_data()),
         reply_markup=specialist_setup_confirmation_keyboard(),
     )
+
+
+@router.callback_query(
+    SpecialistSetupStates.waiting_day_hours,
+    F.data.startswith("setup:hours:all:"),
+)
+async def apply_setup_hours_to_all_days(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    try:
+        source_weekday = int((callback.data or "").rsplit(":", 1)[-1])
+        if source_weekday not in range(7):
+            raise ValueError
+    except ValueError:
+        await callback.answer("Некорректное рабочее время", show_alert=True)
+        return
+
+    data = await state.get_data()
+    selected = sorted(set(data.get("selected_weekdays", [])))
+    intervals = dict(data.get("schedule_intervals", {}))
+    source_interval = intervals.get(str(source_weekday))
+    if not selected or not isinstance(source_interval, list) or len(source_interval) != 2:
+        await callback.answer("Сначала укажите рабочее время", show_alert=True)
+        return
+
+    intervals = {str(weekday): list(source_interval) for weekday in selected}
+    await state.update_data(
+        schedule_intervals=intervals,
+        schedule_index=len(selected),
+    )
+    await state.set_state(SpecialistSetupStates.confirming)
+    await _edit_callback(
+        callback,
+        _schedule_summary(await state.get_data()),
+        reply_markup=specialist_setup_confirmation_keyboard(),
+    )
+    await callback.answer("Время применено ко всем рабочим дням")
 
 
 @router.callback_query(

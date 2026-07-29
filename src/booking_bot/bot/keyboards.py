@@ -754,6 +754,23 @@ def specialist_setup_cancel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def specialist_setup_hours_keyboard(
+    source_weekday: int | None = None,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if source_weekday is not None:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Сохранить время для каждого рабочего дня",
+                    callback_data=f"setup:hours:all:{source_weekday}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="setup:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def specialist_setup_confirmation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
